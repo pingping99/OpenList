@@ -25,6 +25,7 @@ type StartReq struct {
 }
 
 type RemoveReq struct {
+	TaskID           string   `json:"task_id"`
 	Paths            []string `json:"paths"`
 	DeleteCompanions bool     `json:"delete_companions"`
 	RemoveEmptyDirs  bool     `json:"remove_empty_dirs"`
@@ -321,6 +322,7 @@ func HandleBatchRemove(c *gin.Context) {
 		}
 	}
 
+	successPaths := make([]string, 0, len(toDeleteSet))
 	affectedDirsMap := make(map[string]bool)
 	for p := range toDeleteSet {
 		err := fs.Remove(c.Request.Context(), p)
@@ -329,6 +331,7 @@ func HandleBatchRemove(c *gin.Context) {
 			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", p, err))
 		} else {
 			successCount++
+			successPaths = append(successPaths, p)
 			if req.RemoveEmptyDirs {
 				d := path.Dir(p)
 				for d != "" && d != "/" && d != "." {
@@ -336,6 +339,17 @@ func HandleBatchRemove(c *gin.Context) {
 					d = path.Dir(d)
 				}
 			}
+		}
+	}
+
+	// 从本地数据库清理已成功删除的条目，保证重新查询时不会再次出现
+	if len(successPaths) > 0 {
+		dbQuery := db.GetDb().Where("path IN ?", successPaths)
+		if req.TaskID != "" {
+			dbQuery = dbQuery.Where("task_id = ?", req.TaskID)
+		}
+		if err := dbQuery.Delete(&DedupFileItem{}).Error; err != nil {
+			log.Errorf("[dedup] failed to delete cleaned files from DB: %v", err)
 		}
 	}
 

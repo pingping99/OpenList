@@ -493,6 +493,7 @@ const app = createApp({
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
+              task_id: currentTaskId.value,
               paths: paths,
               delete_companions: deleteCompanions.value,
               remove_empty_dirs: removeEmptyDirs.value
