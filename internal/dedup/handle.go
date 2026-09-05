@@ -1,19 +1,18 @@
 package dedup
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -31,7 +30,7 @@ type RemoveReq struct {
 	RemoveEmptyDirs  bool     `json:"remove_empty_dirs"`
 }
 
-// HandleStartScan 启动异步查重任务
+// HandleStartScan 启动异步查重任务 (原生 tache 架构)
 func HandleStartScan(c *gin.Context) {
 	var req StartReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -51,23 +50,6 @@ func HandleStartScan(c *gin.Context) {
 		req.MaxDepth = 30
 	}
 
-	taskID := uuid.NewString()
-	ctx, cancel := context.WithCancel(context.Background())
-
-	tCtx := &TaskContext{
-		Task: DedupTask{
-			ID:        taskID,
-			RootPath:  req.Path,
-			State:     "running",
-			StartedAt: time.Now(),
-		},
-		Cancel: cancel,
-	}
-
-	Tasks.Set(taskID, tCtx)
-	// 立即写入 DB，标记为 running
-	SaveTask(&tCtx.Task)
-
 	cfg := ScanConfig{
 		RootPath:    req.Path,
 		MaxDepth:    req.MaxDepth,
@@ -75,41 +57,49 @@ func HandleStartScan(c *gin.Context) {
 		QPS:         req.QPS,
 	}
 
-	go func() {
-		result, err := ScanWithWorkerPool(ctx, cfg, tCtx)
-		now := time.Now()
-		tCtx.mu.Lock()
-		tCtx.Task.EndedAt = &now
-		if err != nil {
-			if err == context.Canceled {
-				tCtx.Task.State = "canceled"
-			} else {
-				tCtx.Task.State = "failed"
-				tCtx.Task.Error = err.Error()
-			}
-		} else {
-			tCtx.Task.State = "finished"
-			// 将结果写入数据库（分批，不会阻塞 HTTP）
-			SaveDupFiles(taskID, result)
-		}
-		SaveTask(&tCtx.Task)
-		tCtx.mu.Unlock()
+	var creator *model.User
+	if u, ok := c.Request.Context().Value(conf.UserKey).(*model.User); ok {
+		creator = u
+	}
 
-		// 任务结束后从内存中移除，释放内存
-		Tasks.Delete(taskID)
-	}()
+	t, err := AddScanTask(cfg, creator)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"task_id": taskID,
+		"task_id": t.GetID(),
 		"status":  "started",
 	})
 }
 
-// HandleGetStatus 查询任务状态及进度（不返回结果数据）
+// HandleGetStatus 查询任务状态及进度
 func HandleGetStatus(c *gin.Context) {
 	taskID := c.Query("task_id")
 
-	// 优先从内存查询（运行中的任务）
+	// 1. 优先从原生 tache 管理器读取
+	if DedupTaskManager != nil {
+		if t, ok := DedupTaskManager.GetByID(taskID); ok {
+			c.JSON(http.StatusOK, gin.H{
+				"id":            t.GetID(),
+				"root_path":     t.Config.RootPath,
+				"state":         int(t.GetState()),
+				"status":        t.GetStatus(),
+				"progress":      t.GetProgress(),
+				"scanned_dirs":  t.ScannedDirs,
+				"scanned_files": t.ScannedFiles,
+				"dup_groups":    t.DupGroups,
+				"dup_files":     t.DupFiles,
+				"wasted_total":  t.WastedBytes,
+				"start_time":    t.GetStartTime(),
+				"end_time":      t.GetEndTime(),
+			})
+			return
+		}
+	}
+
+	// 2. 从旧内存缓存读取
 	tCtx, ok := Tasks.Get(taskID)
 	if ok {
 		tCtx.mu.Lock()
@@ -119,7 +109,7 @@ func HandleGetStatus(c *gin.Context) {
 		return
 	}
 
-	// 内存中不存在，从数据库查询（已结束的任务）
+	// 3. 从数据库读取已结束的任务
 	var task DedupTask
 	if err := db.GetDb().Where("id = ?", taskID).First(&task).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
@@ -132,7 +122,6 @@ func HandleGetStatus(c *gin.Context) {
 func HandleCancelScan(c *gin.Context) {
 	taskID := c.Query("task_id")
 	if taskID == "" {
-		// 也支持 POST body
 		var body struct {
 			TaskID string `json:"task_id"`
 		}
@@ -140,14 +129,18 @@ func HandleCancelScan(c *gin.Context) {
 			taskID = body.TaskID
 		}
 	}
-	tCtx, ok := Tasks.Get(taskID)
-	if !ok {
-		c.JSON(http.StatusNotFound, gin.H{"error": "task not found or already finished"})
-		return
+
+	// 优先使用原生 tache Manager 取消
+	if DedupTaskManager != nil {
+		DedupTaskManager.Cancel(taskID)
 	}
-	if tCtx.Cancel != nil {
+
+	// 兼容旧内存任务
+	tCtx, ok := Tasks.Get(taskID)
+	if ok && tCtx.Cancel != nil {
 		tCtx.Cancel()
 	}
+
 	c.JSON(http.StatusOK, gin.H{"status": "canceling"})
 }
 
