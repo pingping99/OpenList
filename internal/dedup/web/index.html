@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>重复文件清理工具 - OpenList</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/element-plus@2.7.2/dist/index.css" />
+  <script src="https://cdn.jsdelivr.net/npm/vue@3.4.21/dist/vue.global.prod.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/element-plus@2.7.2/dist/index.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@element-plus/icons-vue@2.3.1/dist/index.iife.min.js"></script>
+  <style>
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background-color: #f0f2f5;
+      color: #303133;
+    }
+    .header-box {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 20px;
+    }
+    .main-card {
+      background: #fff;
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 20px;
+      box-shadow: 0 1px 4px rgba(0, 21, 41, 0.08);
+    }
+    .stat-badge {
+      margin-right: 12px;
+      margin-bottom: 8px;
+    }
+    .dup-group-box {
+      border: 1px solid #ebeef5;
+      border-radius: 6px;
+      background: #fafafa;
+      padding: 14px;
+      margin-bottom: 12px;
+      transition: all 0.2s;
+    }
+    .dup-group-box:hover {
+      border-color: #b3d8ff;
+      background: #f4f8fc;
+    }
+    .dup-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #409eff;
+    }
+    .file-item-row {
+      display: flex;
+      align-items: center;
+      padding: 4px 0;
+      font-size: 13px;
+    }
+    .file-meta-tag {
+      font-size: 12px;
+      color: #909399;
+      margin-left: 12px;
+    }
+    .toolbar-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+    }
+    .text-danger { color: #f56c6c; }
+    .tree-node-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      width: 100%;
+      padding-right: 10px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div class="header-box">
+    <div>
+      <h2 style="margin:0 0 4px 0;">📁 PikPak / 网盘 Hash 重复文件清理工具</h2>
+      <span style="font-size:13px; color:#909399;">基于 GCID 哈希精准去重，零下载、低内存、平滑限速防封</span>
+    </div>
+    <el-button type="info" text @click="goToHome">返回 OpenList 首页</el-button>
+  </div>
+
+  <!-- 扫描配置面板 -->
+  <div class="main-card">
+    <el-form :inline="true" size="default">
+      <el-form-item label="扫描目录范围">
+        <el-input v-model="form.path" placeholder="例如 /pikpak/影视" style="width: 280px;">
+          <template #append>
+            <el-button @click="openDirDialog">浏览目录</el-button>
+          </template>
+        </el-input>
+      </el-form-item>
+
+      <el-form-item label="递归层级">
+        <el-select v-model="form.maxDepth" style="width: 120px;">
+          <el-option label="仅当前目录" :value="1"></el-option>
+          <el-option label="向下 2 层" :value="2"></el-option>
+          <el-option label="向下 5 层" :value="5"></el-option>
+          <el-option label="向下 10 层" :value="10"></el-option>
+          <el-option label="不限深度" :value="30"></el-option>
+        </el-select>
+      </el-form-item>
+
+      <el-form-item label="请求限速 (QPS)">
+        <el-select v-model="form.qps" style="width: 140px;">
+          <el-option label="安全 (1.5 次/秒)" :value="1.5"></el-option>
+          <el-option label="标准 (2.5 次/秒)" :value="2.5"></el-option>
+          <el-option label="较快 (4.0 次/秒)" :value="4.0"></el-option>
+        </el-select>
+      </el-form-item>
+
+      <el-form-item label="并发度">
+        <el-input-number v-model="form.concurrency" :min="1" :max="6" style="width: 100px;"></el-input-number>
+      </el-form-item>
+
+      <el-form-item>
+        <el-button type="primary" :loading="scanning" @click="startScan">
+          {{ scanning ? '正在扫描中...' : '开始查重' }}
+        </el-button>
+        <el-button v-if="scanning" type="danger" @click="cancelScan">终止扫描</el-button>
+      </el-form-item>
+    </el-form>
+
+    <!-- 实时指标卡片 -->
+    <div v-if="status" style="margin-top: 12px; padding-top: 12px; border-top: 1px dashed #e4e7ed;">
+      <el-tag class="stat-badge" type="info">已扫描目录: {{ status.scanned_dirs }}</el-tag>
+      <el-tag class="stat-badge" type="info">已发现文件: {{ status.scanned_files }}</el-tag>
+      <el-tag class="stat-badge" type="warning">发现重复组: {{ status.dup_groups }}</el-tag>
+      <el-tag class="stat-badge" type="danger">累计冗余空间: {{ formatBytes(status.wasted_total) }}</el-tag>
+      <span v-if="scanning" style="font-size:12px; color:#409eff; margin-left:8px;">
+        <el-icon class="is-loading"><Loading /></el-icon> 正在平滑限速遍历中...
+      </span>
+    </div>
+  </div>
+
+  <!-- 查重结果与操作面板 -->
+  <div class="main-card" v-if="allResults.length > 0">
+    <div class="toolbar-row">
+      <div>
+        <h3 style="margin:0 0 4px 0;">查重结果列表 (已按可释放空间从大到小排序)</h3>
+        <span style="font-size:12px; color:#909399;">
+          共发现 {{ allResults.length }} 组重复文件，共占用冗余空间 {{ formatBytes(status ? status.wasted_total : 0) }}
+        </span>
+      </div>
+
+      <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+        <el-button size="small" @click="exportCSV">📥 导出待删清单 (CSV)</el-button>
+        <el-checkbox v-model="deleteCompanions" label="联动删除同名附属文件 (.nfo/.srt/.jpg等)" style="margin:0 4px;"></el-checkbox>
+        <el-checkbox v-model="removeEmptyDirs" label="清理后自动移除空文件夹" style="margin:0 8px;"></el-checkbox>
+        <el-button size="default" type="danger" :disabled="selectedPaths.length === 0" @click="confirmDelete">
+          🗑️ 批量清理选中文件 ({{ selectedPaths.length }})
+        </el-button>
+      </div>
+    </div>
+
+    <!-- 智能选择与特征过滤栏 -->
+    <div style="background:#f8f9fb; padding:12px; border-radius:6px; margin-bottom:16px; display:flex; flex-wrap:wrap; gap:12px; align-items:center;">
+      <span style="font-size:13px; font-weight:600; color:#606266;">智能勾选：</span>
+      <el-button size="small" @click="selectKeepOldest">每组保留最早修改</el-button>
+      <el-button size="small" @click="selectKeepNewest">每组保留最新修改</el-button>
+      <el-button size="small" @click="selectKeepShortest">每组保留路径最短</el-button>
+      <el-button size="small" @click="clearAllSelected">清空所有勾选</el-button>
+
+      <span style="color:#dcdfe6;">|</span>
+
+      <span style="font-size:13px; color:#606266;">路径特征勾选：</span>
+      <el-input v-model="filterKeyword" size="small" placeholder="如 Downloads" style="width:140px;"></el-input>
+      <el-button size="small" type="warning" plain @click="selectByKeyword(true)">优先勾选包含任一关键词</el-button>
+      <el-button size="small" type="success" plain @click="selectByKeyword(false)">保护包含任一关键词</el-button>
+    </div>
+
+    <!-- 重复组展示列表 (分页展示，杜绝前端卡死) -->
+    <div v-for="(g, idx) in pagedResults" :key="g.hash" class="dup-group-box">
+      <div class="dup-header">
+        <span>#{{ (currentPage - 1) * pageSize + idx + 1 }} [Hash: {{ g.hash.substring(0, 16) }}...] 单文件: {{ formatBytes(g.size) }} (共 {{ g.files.length }} 份)</span>
+        <span class="text-danger">可释放空间: {{ formatBytes(g.wasted_bytes) }}</span>
+      </div>
+
+      <div v-for="f in g.files" :key="f.path" class="file-item-row">
+        <el-checkbox :label="f.path" v-model="selectedPathsMap[f.path]" @change="handleSingleCheck(f.path, $event)">
+          <span :style="{textDecoration: selectedPathsMap[f.path] ? 'line-through' : 'none', color: selectedPathsMap[f.path] ? '#f56c6c' : '#303133'}">
+            {{ f.path }}
+          </span>
+          <span class="file-meta-tag">修改时间: {{ formatTime(f.modified) }}</span>
+        </el-checkbox>
+      </div>
+    </div>
+
+    <!-- 分页控件 -->
+    <div style="display:flex; justify-content:center; margin-top:20px;">
+      <el-pagination
+        v-model:current-page="currentPage"
+        v-model:page-size="pageSize"
+        :page-sizes="[10, 20, 50, 100]"
+        layout="total, sizes, prev, pager, next, jumper"
+        :total="allResults.length"
+      />
+    </div>
+  </div>
+
+  <!-- 目录选择弹窗 (优化：带确认、双击快速选定与右侧快捷按钮) -->
+  <el-dialog v-model="dirDialogVisible" title="选择网盘目录范围" width="560px" destroy-on-close>
+    <div style="margin-bottom: 12px; display: flex; gap: 8px; align-items: center;">
+      <el-input v-model="tempSelectedPath" placeholder="当前选中的目录路径">
+        <template #prepend>当前选定：</template>
+      </el-input>
+      <el-button size="default" @click="tempSelectedPath = '/'">设为根目录 /</el-button>
+    </div>
+
+    <div style="border: 1px solid #dcdfe6; border-radius: 4px; max-height: 360px; overflow-y: auto; padding: 8px;">
+      <el-tree
+        :props="{ label: 'name', isLeaf: 'leaf' }"
+        :load="loadTreeDirs"
+        lazy
+        @node-click="handleNodeClick"
+        highlight-current
+      >
+        <template #default="{ node, data }">
+          <div class="tree-node-item" @dblclick.stop="directSelect(data.path)">
+            <span>📁 {{ data.name }}</span>
+            <el-button link type="primary" size="small" @click.stop="directSelect(data.path)">
+              选择此目录
+            </el-button>
+          </div>
+        </template>
+      </el-tree>
+    </div>
+
+    <template #footer>
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <span style="font-size: 12px; color: #909399;">提示：可双击目录或点击右侧「选择此目录」直接载入</span>
+        <div>
+          <el-button @click="dirDialogVisible = false">取消</el-button>
+          <el-button type="primary" @click="confirmDirSelect">确定选定该目录</el-button>
+        </div>
+      </div>
+    </template>
+  </el-dialog>
+</div>
+
+<script>
+const { createApp, ref, reactive, computed } = Vue;
+
+const app = createApp({
+  setup() {
+    const form = reactive({
+      path: '/pikpak',
+      maxDepth: 30,
+      qps: 2.5,
+      concurrency: 3
+    });
+
+    const scanning = ref(false);
+    const status = ref(null);
+    const allResults = ref([]);
+    const selectedPathsMap = reactive({});
+    const deleteCompanions = ref(true);
+    const removeEmptyDirs = ref(true); // 默认勾选清理空文件夹
+    const filterKeyword = ref('Downloads');
+
+    // 分页
+    const currentPage = ref(1);
+    const pageSize = ref(20);
+
+    const pagedResults = computed(() => {
+      const start = (currentPage.value - 1) * pageSize.value;
+      return allResults.value.slice(start, start + pageSize.value);
+    });
+
+    const selectedPaths = computed(() => {
+      return Object.keys(selectedPathsMap).filter(k => selectedPathsMap[k]);
+    });
+
+    const handleSingleCheck = (p, checked) => {
+      selectedPathsMap[p] = checked;
+    };
+
+    const clearAllSelected = () => {
+      for (const k in selectedPathsMap) delete selectedPathsMap[k];
+    };
+
+    let pollTimer = null;
+
+    const formatBytes = (bytes) => {
+      if (!bytes || bytes <= 0) return '0 B';
+      const k = 1024, sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return (bytes / Math.pow(k, i)).toFixed(2) + ' ' + sizes[i];
+    };
+
+    const formatTime = (t) => {
+      if (!t) return '';
+      return new Date(t).toLocaleString('zh-CN', { hour12: false });
+    };
+
+    const startScan = async () => {
+      scanning.value = true;
+      allResults.value = [];
+      clearAllSelected();
+      currentPage.value = 1;
+
+      try {
+        const res = await fetch('/api/dedup/start', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(form)
+        }).then(r => r.json());
+
+        if (res.error) {
+          ElementPlus.ElMessage.error(res.error);
+          scanning.value = false;
+          return;
+        }
+
+        const taskId = res.task_id;
+        pollTimer = setInterval(async () => {
+          const s = await fetch(`/api/dedup/status?task_id=${taskId}`).then(r => r.json());
+          status.value = s;
+          if (s.state === 'finished') {
+            clearInterval(pollTimer);
+            scanning.value = false;
+            allResults.value = s.result || [];
+            selectKeepOldest();
+            ElementPlus.ElMessage.success(`扫描完成！共发现 ${allResults.value.length} 组重复文件`);
+          } else if (s.state === 'failed' || s.state === 'canceled') {
+            clearInterval(pollTimer);
+            scanning.value = false;
+            ElementPlus.ElMessage.warning(s.error || '扫描已终止');
+          }
+        }, 1000);
+      } catch (e) {
+        scanning.value = false;
+        ElementPlus.ElMessage.error('请求失败: ' + e);
+      }
+    };
+
+    const cancelScan = () => {
+      if (status.value) {
+        fetch(`/api/dedup/cancel?task_id=${status.value.id}`, { method: 'POST' });
+      }
+    };
+
+    // 智能勾选：每组保留最早修改
+    const selectKeepOldest = () => {
+      clearAllSelected();
+      allResults.value.forEach(g => {
+        for (let i = 1; i < g.files.length; i++) {
+          selectedPathsMap[g.files[i].path] = true;
+        }
+      });
+    };
+
+    // 智能勾选：每组保留最新修改
+    const selectKeepNewest = () => {
+      clearAllSelected();
+      allResults.value.forEach(g => {
+        for (let i = 0; i < g.files.length - 1; i++) {
+          selectedPathsMap[g.files[i].path] = true;
+        }
+      });
+    };
+
+    // 智能勾选：每组保留路径最短
+    const selectKeepShortest = () => {
+      clearAllSelected();
+      allResults.value.forEach(g => {
+        let shortestIdx = 0;
+        for (let i = 1; i < g.files.length; i++) {
+          if (g.files[i].path.length < g.files[shortestIdx].path.length) {
+            shortestIdx = i;
+          }
+        }
+        for (let i = 0; i < g.files.length; i++) {
+          if (i !== shortestIdx) {
+            selectedPathsMap[g.files[i].path] = true;
+          }
+        }
+      });
+    };
+
+    // 按关键词优先选择/排除
+    const selectByKeyword = (markToDelete) => {
+      const keywords = filterKeyword.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      if (keywords.length === 0) return;
+      allResults.value.forEach(g => {
+        g.files.forEach(f => {
+          if (keywords.some(kw => f.path.toLowerCase().includes(kw))) {
+            selectedPathsMap[f.path] = markToDelete;
+          }
+        });
+      });
+    };
+
+    // 导出 CSV 清单
+    const exportCSV = () => {
+      const paths = selectedPaths.value;
+      if (paths.length === 0) {
+        ElementPlus.ElMessage.warning('当前未勾选任何文件');
+        return;
+      }
+      let csvContent = "data:text/csv;charset=utf-8,\uFEFF路径\n";
+      paths.forEach(p => {
+        csvContent += `"${p}"\n`;
+      });
+      const encodedUri = encodeURI(csvContent);
+      const link = document.createElement("a");
+      link.setAttribute("href", encodedUri);
+      link.setAttribute("download", `待删除重复文件清单_${new Date().toISOString().slice(0,10)}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    };
+
+    // 执行删除
+    const confirmDelete = () => {
+      const paths = selectedPaths.value;
+      let warningText = `确定要永久清理选中的 ${paths.length} 个文件吗？\n`;
+      if (deleteCompanions.value) warningText += `• 将连带清理同目录下同名 .nfo/.srt/.jpg 等附属文件\n`;
+      if (removeEmptyDirs.value) warningText += `• 清理后若产生空目录，将自动移除空文件夹\n`;
+      warningText += `\n注意：文件将被移至网盘回收站，如需立即腾出网盘可用空间，请到 PikPak 官网/App 清空回收站。`;
+
+      ElementPlus.ElMessageBox.confirm(
+        warningText,
+        '安全删除确认',
+        {
+          confirmButtonText: '确定清理',
+          cancelButtonText: '取消',
+          type: 'warning'
+        }
+      ).then(async () => {
+        const loading = ElementPlus.ElLoading.service({ text: '正在清理网盘文件及空目录，请稍候...' });
+        try {
+          const res = await fetch('/api/dedup/remove', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              paths: paths,
+              delete_companions: deleteCompanions.value,
+              remove_empty_dirs: removeEmptyDirs.value
+            })
+          }).then(r => r.json());
+
+          loading.close();
+
+          let msg = `清理完毕！成功删除 ${res.success_count} 个重复文件`;
+          if (res.companion_removed > 0) {
+            msg += `，${res.companion_removed} 个同名附属文件`;
+          }
+          if (res.empty_dirs_removed > 0) {
+            msg += `，已自动清理 ${res.empty_dirs_removed} 个空文件夹`;
+          }
+          msg += `。\n提示：请前往 PikPak 回收站清空以真正释放容量！`;
+
+          ElementPlus.ElMessageBox.alert(msg, '清理完成', { type: 'success' });
+
+          // 从界面上移除已删除项
+          const deletedSet = new Set(paths);
+          allResults.value = allResults.value.map(g => {
+            return {
+              ...g,
+              files: g.files.filter(f => !deletedSet.has(f.path))
+            };
+          }).filter(g => g.files.length > 1);
+
+          for (const p of paths) {
+            delete selectedPathsMap[p];
+          }
+        } catch (e) {
+          loading.close();
+          ElementPlus.ElMessage.error('清理失败: ' + e);
+        }
+      }).catch(() => {});
+    };
+
+    // 目录选择弹窗
+    const dirDialogVisible = ref(false);
+    const tempSelectedPath = ref('/pikpak');
+
+    const openDirDialog = () => {
+      tempSelectedPath.value = form.path || '/';
+      dirDialogVisible.value = true;
+    };
+
+    const loadTreeDirs = async (node, resolve) => {
+      const p = node.level === 0 ? '/' : node.data.path;
+      try {
+        const dirs = await fetch(`/api/dedup/dirs?path=${encodeURIComponent(p)}`).then(r => r.json());
+        resolve((dirs || []).map(d => ({ name: d.name, path: d.path, leaf: false })));
+      } catch (e) {
+        resolve([]);
+      }
+    };
+
+    const handleNodeClick = (data) => {
+      tempSelectedPath.value = data.path;
+    };
+
+    // 双击或点击行内“选择此目录”按钮快速生效
+    const directSelect = (dirPath) => {
+      form.path = dirPath;
+      tempSelectedPath.value = dirPath;
+      dirDialogVisible.value = false;
+      ElementPlus.ElMessage.success(`已选定目录：${dirPath}`);
+    };
+
+    const confirmDirSelect = () => {
+      form.path = tempSelectedPath.value || '/';
+      dirDialogVisible.value = false;
+      ElementPlus.ElMessage.success(`已选定目录：${form.path}`);
+    };
+
+    const goToHome = () => {
+      window.location.href = '/';
+    };
+
+    return {
+      form, scanning, status, allResults, pagedResults, currentPage, pageSize,
+      selectedPathsMap, selectedPaths, deleteCompanions, removeEmptyDirs, filterKeyword,
+      dirDialogVisible, tempSelectedPath,
+      formatBytes, formatTime, startScan, cancelScan, handleSingleCheck, clearAllSelected,
+      selectKeepOldest, selectKeepNewest, selectKeepShortest, selectByKeyword,
+      exportCSV, confirmDelete, openDirDialog, loadTreeDirs, handleNodeClick, directSelect, confirmDirSelect, goToHome
+    };
+  }
+});
+
+for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
+  app.component(key, component);
+}
+app.use(ElementPlus).mount('#app');
+</script>
+</body>
+</html>
