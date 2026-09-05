@@ -53,7 +53,6 @@ func (q *dirWorkQueue) Pop() (scanDirQueueItem, bool) {
 	defer q.mu.Unlock()
 
 	for len(q.items) == 0 && !q.closed {
-		// 如果队列空且没有任何 worker 处于处理中状态，说明所有任务均已完结
 		if q.active == 0 {
 			q.closed = true
 			q.cond.Broadcast()
@@ -76,7 +75,6 @@ func (q *dirWorkQueue) Done() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.active--
-	// 如果队列空且所有活跃任务完成，广播所有 worker 退出
 	if len(q.items) == 0 && q.active == 0 {
 		q.closed = true
 		q.cond.Broadcast()
@@ -105,9 +103,7 @@ func ScanWithWorkerPool(ctx context.Context, cfg ScanConfig, task *TaskContext) 
 		cfg.MaxDepth = 30
 	}
 
-	// 令牌桶限流器 (全局平滑控制 QPS，避免 PikPak 触发 429 冷却)
 	limiter := rate.NewLimiter(rate.Limit(cfg.QPS), 1)
-
 	queue := newDirWorkQueue()
 
 	// 监听 context 取消，及时唤醒队列退出
@@ -125,24 +121,32 @@ func ScanWithWorkerPool(ctx context.Context, cfg ScanConfig, task *TaskContext) 
 		scannedFiles int64
 	)
 
-	// 启动 Worker 线程池
+	// 统计重复组数（实时估算）
+	var dupGroupCount int64
+	var dupFileCount int64
+
 	for i := 0; i < cfg.Concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for {
+				// 检查 context 是否已取消
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
 				item, ok := queue.Pop()
 				if !ok {
 					return
 				}
 
-				// 1. 等待限流令牌
 				if err := limiter.Wait(ctx); err != nil {
 					queue.Done()
 					return
 				}
 
-				// 2. 发起目录列表请求，含 429 异常退避重试
 				meta, _ := op.GetNearestMeta(item.Path)
 				var (
 					objs []model.Obj
@@ -153,7 +157,12 @@ func ScanWithWorkerPool(ctx context.Context, cfg ScanConfig, task *TaskContext) 
 					objs, err = fs.List(context.WithValue(ctx, conf.MetaKey, meta), item.Path, &fs.ListArgs{})
 					if err != nil && (strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate")) {
 						log.Warnf("[dedup] rate limited at %s, backing off for 3s", item.Path)
-						time.Sleep(3 * time.Second)
+						select {
+						case <-ctx.Done():
+							queue.Done()
+							return
+						case <-time.After(3 * time.Second):
+						}
 						continue
 					}
 					break
@@ -166,18 +175,15 @@ func ScanWithWorkerPool(ctx context.Context, cfg ScanConfig, task *TaskContext) 
 					for _, obj := range objs {
 						fullPath := path.Join(item.Path, obj.GetName())
 						if obj.IsDir() {
-							// 深度范围控制：未达最大深度则继续入队
 							if item.Depth < cfg.MaxDepth {
 								queue.Push(scanDirQueueItem{
 									Path:  fullPath,
 									Depth: item.Depth + 1,
 								})
 							}
-						} else if obj.GetSize() > 0 { // 严格排除 0 字节空文件，避免误杀
-							// 提取 PikPak 的 GCID Hash
+						} else if obj.GetSize() > 0 {
 							h := obj.GetHash().GetHash(hash_extend.GCID)
 							if h == "" {
-								// 若无 GCID 则尝试获取通用 Hash 字符串
 								h = obj.GetHash().String()
 							}
 							if h != "" {
@@ -204,13 +210,14 @@ func ScanWithWorkerPool(ctx context.Context, cfg ScanConfig, task *TaskContext) 
 					log.Warnf("[dedup] list dir failed: %s, err: %v", item.Path, err)
 				}
 
-				// 标记当前目录项已完成
 				queue.Done()
 
-				// 定期同步任务进度
+				// 同步进度到内存
 				task.mu.Lock()
-				task.Status.ScannedDirs = atomic.LoadInt64(&scannedDirs)
-				task.Status.ScannedFiles = atomic.LoadInt64(&scannedFiles)
+				task.Task.ScannedDirs = atomic.LoadInt64(&scannedDirs)
+				task.Task.ScannedFiles = atomic.LoadInt64(&scannedFiles)
+				task.Task.DupGroups = int(atomic.LoadInt64(&dupGroupCount))
+				task.Task.DupFiles = int(atomic.LoadInt64(&dupFileCount))
 				task.mu.Unlock()
 			}
 		}()
@@ -218,7 +225,27 @@ func ScanWithWorkerPool(ctx context.Context, cfg ScanConfig, task *TaskContext) 
 
 	// 初始根目录推入队列
 	queue.Push(scanDirQueueItem{Path: cfg.RootPath, Depth: 0})
+
+	// 启动定期持久化协程：每 5 秒写 DB
+	tickerDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				task.mu.Lock()
+				taskCopy := task.Task
+				task.mu.Unlock()
+				SaveTask(&taskCopy)
+			case <-tickerDone:
+				return
+			}
+		}
+	}()
+
 	wg.Wait()
+	close(tickerDone)
 
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -227,14 +254,13 @@ func ScanWithWorkerPool(ctx context.Context, cfg ScanConfig, task *TaskContext) 
 	// ========== 第二阶段：双重过滤，GCID 精确聚合 ==========
 	var dupGroups []DupGroup
 	var totalWasted int64
+	var totalDupFiles int
 
 	for size, files := range sizeMap {
-		// 第一关过滤：大小唯一的文件直接跳过（节省 90% 以上的数据比对）
 		if len(files) < 2 {
 			continue
 		}
 
-		// 第二关过滤：同大小文件按 Hash 分组
 		hashMap := make(map[string][]FileItem)
 		for _, f := range files {
 			hashMap[f.Hash] = append(hashMap[f.Hash], f)
@@ -242,13 +268,13 @@ func ScanWithWorkerPool(ctx context.Context, cfg ScanConfig, task *TaskContext) 
 
 		for h, fList := range hashMap {
 			if len(fList) > 1 {
-				// 组内排序：按修改时间升序排列（最早修改的文件排在第一位）
 				sort.Slice(fList, func(i, j int) bool {
 					return fList[i].Modified.Before(fList[j].Modified)
 				})
 
 				wasted := size * int64(len(fList)-1)
 				totalWasted += wasted
+				totalDupFiles += len(fList)
 
 				dupGroups = append(dupGroups, DupGroup{
 					Hash:        h,
@@ -260,14 +286,14 @@ func ScanWithWorkerPool(ctx context.Context, cfg ScanConfig, task *TaskContext) 
 		}
 	}
 
-	// 结果排序：按冗余浪费的空间降序排列（可释放空间最大的排在最前）
 	sort.Slice(dupGroups, func(i, j int) bool {
 		return dupGroups[i].WastedBytes > dupGroups[j].WastedBytes
 	})
 
 	task.mu.Lock()
-	task.Status.DupGroups = len(dupGroups)
-	task.Status.WastedTotal = totalWasted
+	task.Task.DupGroups = len(dupGroups)
+	task.Task.DupFiles = totalDupFiles
+	task.Task.WastedTotal = totalWasted
 	task.mu.Unlock()
 
 	return dupGroups, nil

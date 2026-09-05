@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -24,8 +26,8 @@ type StartReq struct {
 
 type RemoveReq struct {
 	Paths            []string `json:"paths"`
-	DeleteCompanions bool     `json:"delete_companions"` // 是否连带删除同名附属文件 (.srt/.nfo/.jpg 等)
-	RemoveEmptyDirs  bool     `json:"remove_empty_dirs"` // 清理后是否自动移除空文件夹
+	DeleteCompanions bool     `json:"delete_companions"`
+	RemoveEmptyDirs  bool     `json:"remove_empty_dirs"`
 }
 
 // HandleStartScan 启动异步查重任务
@@ -52,7 +54,7 @@ func HandleStartScan(c *gin.Context) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	tCtx := &TaskContext{
-		Status: TaskStatus{
+		Task: DedupTask{
 			ID:        taskID,
 			RootPath:  req.Path,
 			State:     "running",
@@ -62,6 +64,8 @@ func HandleStartScan(c *gin.Context) {
 	}
 
 	Tasks.Set(taskID, tCtx)
+	// 立即写入 DB，标记为 running
+	SaveTask(&tCtx.Task)
 
 	cfg := ScanConfig{
 		RootPath:    req.Path,
@@ -74,21 +78,24 @@ func HandleStartScan(c *gin.Context) {
 		result, err := ScanWithWorkerPool(ctx, cfg, tCtx)
 		now := time.Now()
 		tCtx.mu.Lock()
-		defer tCtx.mu.Unlock()
-
-		tCtx.Status.EndedAt = &now
+		tCtx.Task.EndedAt = &now
 		if err != nil {
 			if err == context.Canceled {
-				tCtx.Status.State = "canceled"
+				tCtx.Task.State = "canceled"
 			} else {
-				tCtx.Status.State = "failed"
-				tCtx.Status.Error = err.Error()
+				tCtx.Task.State = "failed"
+				tCtx.Task.Error = err.Error()
 			}
 		} else {
-			tCtx.Status.State = "finished"
-			tCtx.Status.Result = result
+			tCtx.Task.State = "finished"
+			// 将结果写入数据库（分批，不会阻塞 HTTP）
+			SaveDupFiles(taskID, result)
 		}
-		persistTask(tCtx)
+		SaveTask(&tCtx.Task)
+		tCtx.mu.Unlock()
+
+		// 任务结束后从内存中移除，释放内存
+		Tasks.Delete(taskID)
 	}()
 
 	c.JSON(http.StatusOK, gin.H{
@@ -97,30 +104,158 @@ func HandleStartScan(c *gin.Context) {
 	})
 }
 
-// HandleGetStatus 查询任务状态及进度
+// HandleGetStatus 查询任务状态及进度（不返回结果数据）
 func HandleGetStatus(c *gin.Context) {
 	taskID := c.Query("task_id")
+
+	// 优先从内存查询（运行中的任务）
 	tCtx, ok := Tasks.Get(taskID)
-	if !ok {
-		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+	if ok {
+		tCtx.mu.Lock()
+		task := tCtx.Task
+		tCtx.mu.Unlock()
+		c.JSON(http.StatusOK, task)
 		return
 	}
 
-	tCtx.mu.Lock()
-	statusCopy := tCtx.Status
-	tCtx.mu.Unlock()
-
-	c.JSON(http.StatusOK, statusCopy)
+	// 内存中不存在，从数据库查询（已结束的任务）
+	var task DedupTask
+	if err := db.GetDb().Where("id = ?", taskID).First(&task).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+		return
+	}
+	c.JSON(http.StatusOK, task)
 }
 
 // HandleCancelScan 终止任务
 func HandleCancelScan(c *gin.Context) {
 	taskID := c.Query("task_id")
+	if taskID == "" {
+		// 也支持 POST body
+		var body struct {
+			TaskID string `json:"task_id"`
+		}
+		if err := c.ShouldBindJSON(&body); err == nil && body.TaskID != "" {
+			taskID = body.TaskID
+		}
+	}
 	tCtx, ok := Tasks.Get(taskID)
-	if ok && tCtx.Cancel != nil {
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "task not found or already finished"})
+		return
+	}
+	if tCtx.Cancel != nil {
 		tCtx.Cancel()
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "canceling"})
+}
+
+// HandleGetResult 分页获取任务的重复文件结果
+func HandleGetResult(c *gin.Context) {
+	taskID := c.Query("task_id")
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	size, _ := strconv.Atoi(c.DefaultQuery("size", "20"))
+	if page < 1 {
+		page = 1
+	}
+	if size < 1 || size > 200 {
+		size = 20
+	}
+
+	// 先查重复的 hash 列表（分页是在 hash 组级别）
+	var hashes []string
+	d := db.GetDb()
+	d.Model(&DedupFileItem{}).
+		Select("hash").
+		Where("task_id = ?", taskID).
+		Group("hash").
+		Having("COUNT(*) > 1").
+		Order("MAX(size) * (COUNT(*) - 1) DESC").
+		Offset((page - 1) * size).
+		Limit(size).
+		Pluck("hash", &hashes)
+
+	// 统计总组数
+	var totalGroups int64
+	d.Model(&DedupFileItem{}).
+		Select("hash").
+		Where("task_id = ?", taskID).
+		Group("hash").
+		Having("COUNT(*) > 1").
+		Count(&totalGroups)
+
+	if len(hashes) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"total":  totalGroups,
+			"page":   page,
+			"size":   size,
+			"groups": []DupGroup{},
+		})
+		return
+	}
+
+	// 查出这些 hash 下的所有文件
+	var items []DedupFileItem
+	d.Where("task_id = ? AND hash IN ?", taskID, hashes).
+		Order("hash, modified ASC").
+		Find(&items)
+
+	// 组装成 DupGroup
+	groupMap := make(map[string]*DupGroup)
+	var groupOrder []string
+	for _, item := range items {
+		g, ok := groupMap[item.Hash]
+		if !ok {
+			g = &DupGroup{
+				Hash: item.Hash,
+				Size: item.Size,
+			}
+			groupMap[item.Hash] = g
+			groupOrder = append(groupOrder, item.Hash)
+		}
+		g.Files = append(g.Files, FileItem{
+			Path:     item.Path,
+			Name:     item.Name,
+			Size:     item.Size,
+			Hash:     item.Hash,
+			Modified: item.Modified,
+		})
+	}
+
+	var groups []DupGroup
+	for _, h := range groupOrder {
+		g := groupMap[h]
+		g.WastedBytes = g.Size * int64(len(g.Files)-1)
+		groups = append(groups, *g)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"total":  totalGroups,
+		"page":   page,
+		"size":   size,
+		"groups": groups,
+	})
+}
+
+// HandleListHistory 列出所有历史任务
+func HandleListHistory(c *gin.Context) {
+	var tasks []DedupTask
+	if err := db.GetDb().Order("started_at DESC").Find(&tasks).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, tasks)
+}
+
+// HandleGetHistoryDetail 获取单个历史任务详情
+func HandleGetHistoryDetail(c *gin.Context) {
+	taskID := c.Param("id")
+	var task DedupTask
+	if err := db.GetDb().Where("id = ?", taskID).First(&task).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+		return
+	}
+	c.JSON(http.StatusOK, task)
 }
 
 // 常见媒体附属文件后缀
@@ -142,15 +277,12 @@ func HandleBatchRemove(c *gin.Context) {
 	companionRemoved := 0
 	var errMsgs []string
 
-	// 用 map 记录已删除或待删除的文件，避免重复删
 	toDeleteSet := make(map[string]bool)
 	for _, p := range req.Paths {
 		toDeleteSet[p] = true
 	}
 
-	// 若开启了联动删除附属文件
 	if req.DeleteCompanions {
-		// 按目录分组待删视频
 		dirToFiles := make(map[string][]string)
 		for _, p := range req.Paths {
 			dir := path.Dir(p)
@@ -158,7 +290,6 @@ func HandleBatchRemove(c *gin.Context) {
 		}
 
 		for dir, files := range dirToFiles {
-			// 列出同目录下的文件
 			objs, err := fs.List(c.Request.Context(), dir, &fs.ListArgs{})
 			if err != nil {
 				continue
@@ -176,7 +307,6 @@ func HandleBatchRemove(c *gin.Context) {
 					objName := obj.GetName()
 					objExt := strings.ToLower(filepath.Ext(objName))
 
-					// 检查是否为同名附属文件 (如 movie.zh.srt 或 movie-poster.jpg)
 					if companionExts[objExt] {
 						if strings.HasPrefix(objName, baseName) {
 							fullCompanionPath := path.Join(dir, objName)
@@ -191,7 +321,6 @@ func HandleBatchRemove(c *gin.Context) {
 		}
 	}
 
-	// 统一执行删除
 	affectedDirsMap := make(map[string]bool)
 	for p := range toDeleteSet {
 		err := fs.Remove(c.Request.Context(), p)
@@ -201,7 +330,6 @@ func HandleBatchRemove(c *gin.Context) {
 		} else {
 			successCount++
 			if req.RemoveEmptyDirs {
-				// 收集受影响的目录
 				d := path.Dir(p)
 				for d != "" && d != "/" && d != "." {
 					affectedDirsMap[d] = true
@@ -212,9 +340,7 @@ func HandleBatchRemove(c *gin.Context) {
 	}
 
 	emptyDirsRemoved := 0
-	// 若启用了自动移除空文件夹
 	if req.RemoveEmptyDirs && len(affectedDirsMap) > 0 {
-		// 按路径深度（长度）从深到浅排序，确保优先检查并删除底层空目录
 		var sortedDirs []string
 		for d := range affectedDirsMap {
 			sortedDirs = append(sortedDirs, d)
