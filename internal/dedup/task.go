@@ -2,7 +2,9 @@ package dedup
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
@@ -12,21 +14,31 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// DedupScanTask 遵循 OpenList 官方 tache 规范的标准去重扫描任务
+// DedupScanTask 遵循 OpenList 官方 tache 规范的去重扫描任务。
+//
+// 所有可变状态（status/progress/stats）都由 mu 保护：后台任务在写、HTTP 接口在并发读，
+// 旧实现让接口无锁直接读这些字段，存在数据竞争。
 type DedupScanTask struct {
 	task.TaskExtension
-	Name         string     `json:"name"`
-	Status       string     `json:"-"`
-	Progress     float64    `json:"-"`
-	Config       ScanConfig `json:"config"`
-	ScannedDirs  int64      `json:"scanned_dirs"`
-	ScannedFiles int64      `json:"scanned_files"`
-	DupGroups    int        `json:"dup_groups"`
-	DupFiles     int        `json:"dup_files"`
-	WastedBytes  int64      `json:"wasted_bytes"`
+
+	Name   string     `json:"name"`
+	Config ScanConfig `json:"config"`
+
+	mu       sync.RWMutex
+	status   string
+	progress float64
+	stats    ScanStats
 }
 
 var _ task.TaskExtensionInfo = (*DedupScanTask)(nil)
+
+// TaskStatus 是任务状态对外的统一视图（HTTP 接口与内置任务列表共用同一份结构）
+type TaskStatus struct {
+	State    string    `json:"state"`
+	Status   string    `json:"status"`
+	Progress float64   `json:"progress"`
+	Stats    ScanStats `json:"stats"`
+}
 
 func (t *DedupScanTask) GetName() string {
 	if t.Name != "" {
@@ -36,19 +48,71 @@ func (t *DedupScanTask) GetName() string {
 }
 
 func (t *DedupScanTask) GetStatus() string {
-	return t.Status
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.status
 }
 
 func (t *DedupScanTask) SetStatus(s string) {
-	t.Status = s
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.status = s
 }
 
 func (t *DedupScanTask) GetProgress() float64 {
-	return t.Progress
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.progress
 }
 
 func (t *DedupScanTask) SetProgress(p float64) {
-	t.Progress = p
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.progress = p
+}
+
+// Stats 返回统计快照（并发安全）
+func (t *DedupScanTask) Stats() ScanStats {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.stats
+}
+
+// Snapshot 返回状态、进度与统计的一致快照
+func (t *DedupScanTask) Snapshot() TaskStatus {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return TaskStatus{
+		State:    tacheStateName(t.GetState()),
+		Status:   t.status,
+		Progress: t.progress,
+		Stats:    t.stats,
+	}
+}
+
+// tacheStateName 把 tache 内部状态统一映射为字符串。旧实现同一接口在不同分支
+// 分别返回 int 与 string 两种 state 形态，前端无法统一处理。
+func tacheStateName(s tache.State) string {
+	switch s {
+	case tache.StateRunning:
+		return "running"
+	case tache.StateSucceeded:
+		return "finished"
+	case tache.StateCanceling:
+		return "canceling"
+	case tache.StateCanceled:
+		return "canceled"
+	case tache.StateErrored:
+		return "errored"
+	case tache.StateFailing:
+		return "failed"
+	case tache.StateFailed:
+		return "failed"
+	case tache.StateWaitingRetry, tache.StatePending, tache.StateBeforeRetry:
+		return "queued"
+	default:
+		return "unknown"
+	}
 }
 
 // Run 执行具体的扫描逻辑 (tache 框架调度入口)
@@ -60,108 +124,104 @@ func (t *DedupScanTask) Run() error {
 
 	now := time.Now()
 	t.SetStartTime(now)
+	t.SetStatus("正在扫描...")
+	t.SetProgress(0)
 
-	SaveTask(&DedupTask{
+	progress := &Progress{}
+	taskRow := &DedupTask{
 		ID:        t.GetID(),
 		RootPath:  t.Config.RootPath,
 		State:     "running",
 		StartedAt: now,
-	})
-
-	tCtx := &TaskContext{
-		Task: DedupTask{
-			ID:        t.GetID(),
-			RootPath:  t.Config.RootPath,
-			State:     "running",
-			StartedAt: now,
-		},
-		Cancel: func() {
-			t.Cancel()
-		},
 	}
+	if creator := t.GetCreator(); creator != nil {
+		taskRow.Creator = creator.Username
+		taskRow.CreatorID = creator.ID
+	}
+	SaveTask(taskRow)
 
-	progressStop := make(chan struct{})
+	// 进度上报：定时把原子计数快照同步到任务状态并落库
+	reportDone := make(chan struct{})
+	var reportWG sync.WaitGroup
+	reportWG.Add(1)
 	go func() {
+		defer reportWG.Done()
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				tCtx.mu.Lock()
-				t.ScannedDirs = tCtx.Task.ScannedDirs
-				t.ScannedFiles = tCtx.Task.ScannedFiles
-				t.SetStatus(fmt.Sprintf("已扫描 %d 目录 / %d 文件", t.ScannedDirs, t.ScannedFiles))
-				tCtx.mu.Unlock()
+				snap := progress.Snapshot()
+				t.mu.Lock()
+				t.stats = snap
+				t.status = fmt.Sprintf("已扫描 %d 目录 / %d 文件", snap.ScannedDirs, snap.ScannedFiles)
+				t.mu.Unlock()
 				t.Persist()
-			case <-progressStop:
+			case <-reportDone:
 				return
 			}
 		}
 	}()
 
-	groups, err := ScanWithWorkerPool(ctx, t.Config, tCtx)
-	close(progressStop)
+	groups, err := Scan(ctx, t.Config, progress)
+	close(reportDone)
+	reportWG.Wait() // 等上报协程退出，避免它在终态统计之后再次覆写状态
+
+	// 扫描结束后重新取快照，保证终态统计包含最后一批目录/文件
+	stats := progress.Snapshot()
+	t.mu.Lock()
+	t.stats = stats
+	t.mu.Unlock()
 
 	end := time.Now()
 	t.SetEndTime(end)
 
+	state := "finished"
+	taskErr := ""
 	if err != nil {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			state = "canceled"
 			t.SetStatus("任务已取消")
-			SaveTask(&DedupTask{
-				ID:           t.GetID(),
-				RootPath:     t.Config.RootPath,
-				State:        "canceled",
-				ScannedDirs:  t.ScannedDirs,
-				ScannedFiles: t.ScannedFiles,
-				StartedAt:    now,
-				EndedAt:      &end,
-			})
 		} else {
+			state = "failed"
+			taskErr = err.Error()
 			t.SetStatus(fmt.Sprintf("扫描失败: %v", err))
-			SaveTask(&DedupTask{
-				ID:           t.GetID(),
-				RootPath:     t.Config.RootPath,
-				State:        "failed",
-				Error:        err.Error(),
-				ScannedDirs:  t.ScannedDirs,
-				ScannedFiles: t.ScannedFiles,
-				StartedAt:    now,
-				EndedAt:      &end,
-			})
 		}
-		return err
+	} else {
+		t.SetProgress(100)
+		t.SetStatus(fmt.Sprintf(
+			"发现 %d 组重复 (共 %d 文件)，可释放 %s；另有 %d 组同名同尺寸候选待人工确认",
+			stats.DupGroups, stats.DupFiles, formatBytes(stats.WastedBytes), stats.CandidateGroups,
+		))
+		if stats.UnverifiedFiles > 0 {
+			log.Warnf("[dedup] task %s: %d files without storage hash are listed as candidates only",
+				t.GetID(), stats.UnverifiedFiles)
+		}
+		SaveDupFiles(t.GetID(), groups)
 	}
-
-	t.DupGroups = len(groups)
-	var dupFiles int
-	var totalWasted int64
-	for _, g := range groups {
-		dupFiles += len(g.Files)
-		totalWasted += g.WastedBytes
-	}
-	t.DupFiles = dupFiles
-	t.WastedBytes = totalWasted
-	t.SetTotalBytes(totalWasted)
-	t.SetProgress(100)
-	t.SetStatus(fmt.Sprintf("发现 %d 组重复 (共 %d 文件)，可释放 %s", t.DupGroups, t.DupFiles, formatBytes(totalWasted)))
-
-	SaveDupFiles(t.GetID(), groups)
 
 	SaveTask(&DedupTask{
-		ID:           t.GetID(),
-		RootPath:     t.Config.RootPath,
-		State:        "finished",
-		ScannedDirs:  t.ScannedDirs,
-		ScannedFiles: t.ScannedFiles,
-		DupGroups:    t.DupGroups,
-		DupFiles:     t.DupFiles,
-		WastedTotal:  totalWasted,
-		StartedAt:    now,
-		EndedAt:      &end,
+		ID:              t.GetID(),
+		RootPath:        t.Config.RootPath,
+		State:           state,
+		Creator:         taskRow.Creator,
+		CreatorID:       taskRow.CreatorID,
+		ScannedDirs:     stats.ScannedDirs,
+		ScannedFiles:    stats.ScannedFiles,
+		VerifiedFiles:   stats.VerifiedFiles,
+		UnverifiedFiles: stats.UnverifiedFiles,
+		FailedDirs:      stats.FailedDirs,
+		DupGroups:       stats.DupGroups,
+		DupFiles:        stats.DupFiles,
+		WastedTotal:     stats.WastedBytes,
+		CandidateGroups: stats.CandidateGroups,
+		CandidateFiles:  stats.CandidateFiles,
+		Error:           taskErr,
+		StartedAt:       now,
+		EndedAt:         &end,
 	})
 
-	return nil
+	return err
 }
 
 func formatBytes(bytes int64) string {
@@ -196,9 +256,13 @@ func InitTaskManager() {
 
 // AddScanTask 创建并提交扫描任务
 func AddScanTask(cfg ScanConfig, creator *model.User) (*DedupScanTask, error) {
+	if DedupTaskManager == nil {
+		return nil, errors.New("去重任务管理器未初始化")
+	}
+	cfg = normalizeScanConfig(cfg)
 	t := &DedupScanTask{
-		Config: cfg,
 		Name:   fmt.Sprintf("去重: %s", cfg.RootPath),
+		Config: cfg,
 	}
 	if creator != nil {
 		t.SetCreator(creator)

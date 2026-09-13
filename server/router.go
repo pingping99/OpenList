@@ -112,7 +112,8 @@ func Init(e *gin.Engine) {
 	if flags.Debug || flags.Dev {
 		debug(g.Group("/debug"))
 	}
-	dedup.RegisterRouter(e)
+	// 查重模块挂在鉴权分组下，接口路径仍为 /api/dedup/*
+	dedup.RegisterRouter(auth.Group("/dedup", middlewares.AuthNotGuest))
 	static.Static(g, func(handlers ...gin.HandlerFunc) {
 		e.NoRoute(handlers...)
 	})

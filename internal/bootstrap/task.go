@@ -50,5 +50,5 @@ func InitTaskManager() {
 	op.RegisterSettingChangingCallback(func() {
 		fs.ArchiveContentUploadTaskManager.SetWorkersNumActive(taskFilterNegative(setting.GetInt(conf.TaskDecompressUploadThreadsNum, conf.Conf.Tasks.DecompressUpload.Workers)))
 	})
-	dedup.InitTaskManager()
+	dedup.Init()
 }
