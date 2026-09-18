@@ -25,7 +25,7 @@ const (
 	defaultQPS         = 2.5
 	minQPS             = 0.1
 	maxQPS             = 200
-	defaultMaxDepth    = 30
+	defaultMaxDepth    = 10
 	maxMaxDepth        = 64
 )
 
