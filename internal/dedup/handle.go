@@ -782,6 +782,12 @@ func HandleBatchRemove(c *gin.Context) {
 		}
 	}
 
+	if errMsgs == nil {
+		errMsgs = make([]string, 0)
+	}
+	if rejected == nil {
+		rejected = make([]removeRejection, 0)
+	}
 	common.SuccessResp(c, gin.H{
 		"success_count":      len(successPaths),
 		"companion_removed":  companionRemoved,

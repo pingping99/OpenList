@@ -1,6 +1,7 @@
 package dedup
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -83,5 +84,35 @@ func TestGuardCompanionPrefixIsStrict(t *testing.T) {
 		if got := isCompanionOf(c.obj, c.video); got != c.want {
 			t.Errorf("isCompanionOf(%q, %q) = %v, want %v", c.obj, c.video, got, c.want)
 		}
+	}
+}
+
+func TestRemoveResponseJSONEmptySlices(t *testing.T) {
+	var errMsgs []string
+	var rejected []removeRejection
+
+	if errMsgs == nil {
+		errMsgs = make([]string, 0)
+	}
+	if rejected == nil {
+		rejected = make([]removeRejection, 0)
+	}
+
+	payload := map[string]any{
+		"errors":   errMsgs,
+		"rejected": rejected,
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("failed to marshal: %v", err)
+	}
+
+	jsonStr := string(data)
+	if strings.Contains(jsonStr, "null") {
+		t.Fatalf("expected JSON to not contain null for arrays, got: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"errors":[]`) || !strings.Contains(jsonStr, `"rejected":[]`) {
+		t.Fatalf("expected empty arrays in JSON, got: %s", jsonStr)
 	}
 }
