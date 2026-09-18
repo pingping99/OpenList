@@ -29,6 +29,28 @@ const (
 	maxMaxDepth        = 64
 )
 
+func cleanExtList(exts []string) []string {
+	if len(exts) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(exts))
+	seen := make(map[string]struct{}, len(exts))
+	for _, e := range exts {
+		for _, part := range strings.Split(e, ",") {
+			cleaned := strings.ToLower(strings.TrimSpace(part))
+			cleaned = strings.TrimPrefix(cleaned, ".")
+			if cleaned == "" {
+				continue
+			}
+			if _, ok := seen[cleaned]; !ok {
+				seen[cleaned] = struct{}{}
+				out = append(out, cleaned)
+			}
+		}
+	}
+	return out
+}
+
 // normalizeScanConfig 收敛用户传入的扫描参数，避免异常参数打爆存储或造成无限递归
 func normalizeScanConfig(cfg ScanConfig) ScanConfig {
 	if cfg.RootPath == "" {
@@ -56,6 +78,11 @@ func normalizeScanConfig(cfg ScanConfig) ScanConfig {
 	if cfg.MaxDepth > maxMaxDepth {
 		cfg.MaxDepth = maxMaxDepth
 	}
+	if cfg.MinSize < 0 {
+		cfg.MinSize = 0
+	}
+	cfg.IncludeExts = cleanExtList(cfg.IncludeExts)
+	cfg.ExcludeExts = cleanExtList(cfg.ExcludeExts)
 	return cfg
 }
 
@@ -236,6 +263,34 @@ func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([
 					queue.Push(scanDirQueueItem{Path: path.Join(dir, obj.GetName()), Depth: depth + 1})
 				}
 				continue
+			}
+			if cfg.MinSize > 0 && obj.GetSize() < cfg.MinSize {
+				continue
+			}
+			ext := strings.ToLower(strings.TrimPrefix(path.Ext(obj.GetName()), "."))
+			if len(cfg.IncludeExts) > 0 {
+				matched := false
+				for _, ie := range cfg.IncludeExts {
+					if ext == ie {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					continue
+				}
+			}
+			if len(cfg.ExcludeExts) > 0 {
+				excluded := false
+				for _, ee := range cfg.ExcludeExts {
+					if ext == ee {
+						excluded = true
+						break
+					}
+				}
+				if excluded {
+					continue
+				}
 			}
 			item := FileItem{
 				Path:     path.Join(dir, obj.GetName()),

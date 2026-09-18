@@ -72,10 +72,13 @@ type DupGroup struct {
 
 // ScanConfig 扫描配置
 type ScanConfig struct {
-	RootPath    string  `json:"path"`
-	MaxDepth    int     `json:"max_depth"`
-	Concurrency int     `json:"concurrency"`
-	QPS         float64 `json:"qps"`
+	RootPath    string   `json:"path"`
+	MaxDepth    int      `json:"max_depth"`
+	Concurrency int      `json:"concurrency"`
+	QPS         float64  `json:"qps"`
+	MinSize     int64    `json:"min_size"`     // 最小文件大小过滤（字节），<=0 表示不过滤
+	IncludeExts []string `json:"include_exts"` // 仅包含的扩展名（小写，不带点，空表示不过滤）
+	ExcludeExts []string `json:"exclude_exts"` // 排除的扩展名（小写，不带点）
 }
 
 // ==================== 任务进度 ====================

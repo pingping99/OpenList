@@ -27,10 +27,13 @@ import (
 )
 
 type StartReq struct {
-	Path        string  `json:"path"`
-	MaxDepth    int     `json:"max_depth"`
-	Concurrency int     `json:"concurrency"`
-	QPS         float64 `json:"qps"`
+	Path        string   `json:"path"`
+	MaxDepth    int      `json:"max_depth"`
+	Concurrency int      `json:"concurrency"`
+	QPS         float64  `json:"qps"`
+	MinSize     int64    `json:"min_size"`
+	IncludeExts []string `json:"include_exts"`
+	ExcludeExts []string `json:"exclude_exts"`
 }
 
 type RemoveReq struct {
@@ -121,6 +124,9 @@ func HandleStartScan(c *gin.Context) {
 		MaxDepth:    req.MaxDepth,
 		Concurrency: req.Concurrency,
 		QPS:         req.QPS,
+		MinSize:     req.MinSize,
+		IncludeExts: req.IncludeExts,
+		ExcludeExts: req.ExcludeExts,
 	})
 
 	// 同一个目录不允许并发重复扫描
