@@ -187,7 +187,7 @@ func Static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc)) {
 		r.Use(func(c *gin.Context) {
 			for _, folder := range folders {
 				if strings.HasPrefix(c.Request.RequestURI, fmt.Sprintf("/%s/", folder)) {
-					if strings.Contains(c.Request.RequestURI, "Dedup") {
+					if strings.Contains(c.Request.RequestURI, "Dedup") || strings.Contains(c.Request.RequestURI, "entry") || strings.Contains(c.Request.RequestURI, "manage") {
 						c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
 					} else {
 						c.Header("Cache-Control", "public, max-age=15552000")
