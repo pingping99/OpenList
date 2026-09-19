@@ -187,7 +187,11 @@ func Static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc)) {
 		r.Use(func(c *gin.Context) {
 			for _, folder := range folders {
 				if strings.HasPrefix(c.Request.RequestURI, fmt.Sprintf("/%s/", folder)) {
-					c.Header("Cache-Control", "public, max-age=15552000")
+					if strings.Contains(c.Request.RequestURI, "Dedup") || strings.Contains(c.Request.RequestURI, "entry") || strings.Contains(c.Request.RequestURI, "manage") || strings.Contains(c.Request.RequestURI, "index") || strings.Contains(c.Request.RequestURI, "store") {
+						c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+					} else {
+						c.Header("Cache-Control", "public, max-age=15552000")
+					}
 				}
 			}
 		})
@@ -216,6 +220,7 @@ func Static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc)) {
 			return
 		}
 		c.Header("Content-Type", "text/html")
+		c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
 		c.Status(200)
 		if strings.HasPrefix(c.Request.URL.Path, "/@manage") {
 			_, _ = c.Writer.WriteString(conf.ManageHtml)
