@@ -354,9 +354,11 @@ func HandleGetResult(c *gin.Context) {
 		verified = &v
 	}
 
+	kw := strings.TrimSpace(c.Query("kw"))
+
 	// 分组键按「可释放空间」降序分页
 	var keys []string
-	if err := resultGroupsQuery(taskID, verified).
+	if err := resultGroupsQuery(taskID, verified, kw).
 		Select("group_key").
 		Group("group_key").
 		Having("COUNT(*) > 1").
@@ -369,7 +371,7 @@ func HandleGetResult(c *gin.Context) {
 	}
 
 	var total int64
-	if err := resultGroupsQuery(taskID, verified).
+	if err := resultGroupsQuery(taskID, verified, kw).
 		Select("group_key").
 		Group("group_key").
 		Having("COUNT(*) > 1").
@@ -434,10 +436,21 @@ func HandleGetResult(c *gin.Context) {
 	})
 }
 
-func resultGroupsQuery(taskID string, verified *bool) *gorm.DB {
+func resultGroupsQuery(taskID string, verified *bool, kw string) *gorm.DB {
 	q := db.GetDb().Model(&DedupFileItem{}).Where("task_id = ?", taskID)
 	if verified != nil {
 		q = q.Where("verified = ?", *verified)
+	}
+	if kw != "" {
+		matchPattern := "%" + kw + "%"
+		subQuery := db.GetDb().Model(&DedupFileItem{}).
+			Select("DISTINCT group_key").
+			Where("task_id = ?", taskID).
+			Where("path LIKE ? OR name LIKE ? OR group_key LIKE ?", matchPattern, matchPattern, matchPattern)
+		if verified != nil {
+			subQuery = subQuery.Where("verified = ?", *verified)
+		}
+		q = q.Where("group_key IN (?)", subQuery)
 	}
 	return q
 }

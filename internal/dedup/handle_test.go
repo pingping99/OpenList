@@ -4,6 +4,12 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
 )
 
 // TestGuardKeepOneCopy 覆盖「同一组重复文件不能被删光」的服务端兜底逻辑。
@@ -139,5 +145,185 @@ func TestDedupTask_InitialAndCleanedCounters(t *testing.T) {
 	if task.CleanedBytes != 400 {
 		t.Errorf("expected 400 cleaned bytes, got %d", task.CleanedBytes)
 	}
+}
+
+func TestResultGroupsQuery_KeywordSearch(t *testing.T) {
+	dB, err := gorm.Open(sqlite.Open("file:mem_result_groups?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("failed to open memory db: %v", err)
+	}
+	conf.Conf = conf.DefaultConfig("data")
+	db.Init(dB)
+	if err := db.AutoMigrate(&DedupFileItem{}); err != nil {
+		t.Fatalf("failed to migrate DedupFileItem: %v", err)
+	}
+
+	taskID := "task-kw-test"
+	now := time.Now()
+
+	// 准备测试数据
+	items := []DedupFileItem{
+		// 组 1: sha1:111, Verified: true, 大小 1000
+		{TaskID: taskID, GroupKey: "sha1:111", Verified: true, Path: "/movies/IronMan.mp4", Name: "IronMan.mp4", Size: 1000, Modified: now},
+		{TaskID: taskID, GroupKey: "sha1:111", Verified: true, Path: "/backup/IronMan.mp4", Name: "IronMan.mp4", Size: 1000, Modified: now},
+
+		// 组 2: sha1:222, Verified: true, 大小 2000
+		{TaskID: taskID, GroupKey: "sha1:222", Verified: true, Path: "/movies/SpiderMan.mkv", Name: "SpiderMan.mkv", Size: 2000, Modified: now},
+		{TaskID: taskID, GroupKey: "sha1:222", Verified: true, Path: "/archive/SpiderMan.mkv", Name: "SpiderMan.mkv", Size: 2000, Modified: now},
+
+		// 组 3: name_size:333, Verified: false, 大小 3000
+		{TaskID: taskID, GroupKey: "name_size:333", Verified: false, Path: "/downloads/Batman.avi", Name: "Batman.avi", Size: 3000, Modified: now},
+		{TaskID: taskID, GroupKey: "name_size:333", Verified: false, Path: "/videos/Batman.avi", Name: "Batman.avi", Size: 3000, Modified: now},
+
+		// 组 4: sha1:444, Verified: true, 大小 500
+		{TaskID: taskID, GroupKey: "sha1:444", Verified: true, Path: "/docs/invoice_2026.pdf", Name: "invoice_2026.pdf", Size: 500, Modified: now},
+		{TaskID: taskID, GroupKey: "sha1:444", Verified: true, Path: "/backup/invoice_2026.pdf", Name: "invoice_2026.pdf", Size: 500, Modified: now},
+
+		// 孤立文件（不是重复组）
+		{TaskID: taskID, GroupKey: "sha1:999", Verified: true, Path: "/single/unique.txt", Name: "unique.txt", Size: 100, Modified: now},
+	}
+	if err := db.GetDb().Create(&items).Error; err != nil {
+		t.Fatalf("failed to insert test items: %v", err)
+	}
+
+	trueVal := true
+	falseVal := false
+
+	t.Run("无关键词时返回所有已验证重复分组并按可释放空间降序排序", func(t *testing.T) {
+		var keys []string
+		err := resultGroupsQuery(taskID, &trueVal, "").
+			Select("group_key").
+			Group("group_key").
+			Having("COUNT(*) > 1").
+			Order("MAX(size) * (COUNT(*) - 1) DESC").
+			Pluck("group_key", &keys).Error
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		if len(keys) != 3 {
+			t.Fatalf("expected 3 verified groups, got %d: %v", len(keys), keys)
+		}
+		// 排序验证: sha1:222 (2000) > sha1:111 (1000) > sha1:444 (500)
+		if keys[0] != "sha1:222" || keys[1] != "sha1:111" || keys[2] != "sha1:444" {
+			t.Fatalf("unexpected order: %v", keys)
+		}
+
+		var total int64
+		err = resultGroupsQuery(taskID, &trueVal, "").
+			Select("group_key").
+			Group("group_key").
+			Having("COUNT(*) > 1").
+			Count(&total).Error
+		if err != nil {
+			t.Fatalf("count failed: %v", err)
+		}
+		if total != 3 {
+			t.Fatalf("expected total 3, got %d", total)
+		}
+	})
+
+	t.Run("按文件名模糊检索", func(t *testing.T) {
+		var keys []string
+		err := resultGroupsQuery(taskID, &trueVal, "Iron").
+			Select("group_key").
+			Group("group_key").
+			Having("COUNT(*) > 1").
+			Pluck("group_key", &keys).Error
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		if len(keys) != 1 || keys[0] != "sha1:111" {
+			t.Fatalf("expected ['sha1:111'], got %v", keys)
+		}
+
+		var total int64
+		err = resultGroupsQuery(taskID, &trueVal, "Iron").
+			Select("group_key").
+			Group("group_key").
+			Having("COUNT(*) > 1").
+			Count(&total).Error
+		if err != nil {
+			t.Fatalf("count failed: %v", err)
+		}
+		if total != 1 {
+			t.Fatalf("expected total 1, got %d", total)
+		}
+	})
+
+	t.Run("按路径模糊检索", func(t *testing.T) {
+		var keys []string
+		err := resultGroupsQuery(taskID, &trueVal, "backup").
+			Select("group_key").
+			Group("group_key").
+			Having("COUNT(*) > 1").
+			Order("MAX(size) * (COUNT(*) - 1) DESC").
+			Pluck("group_key", &keys).Error
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		// 命中 sha1:111 (/backup/IronMan.mp4) 和 sha1:444 (/backup/invoice_2026.pdf)
+		if len(keys) != 2 || keys[0] != "sha1:111" || keys[1] != "sha1:444" {
+			t.Fatalf("expected ['sha1:111', 'sha1:444'], got %v", keys)
+		}
+	})
+
+	t.Run("未确认候选组中检索", func(t *testing.T) {
+		var keys []string
+		err := resultGroupsQuery(taskID, &falseVal, "Batman").
+			Select("group_key").
+			Group("group_key").
+			Having("COUNT(*) > 1").
+			Pluck("group_key", &keys).Error
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		if len(keys) != 1 || keys[0] != "name_size:333" {
+			t.Fatalf("expected ['name_size:333'], got %v", keys)
+		}
+
+		// 在已确认组中检索 Batman 应当为空
+		var verifiedKeys []string
+		err = resultGroupsQuery(taskID, &trueVal, "Batman").
+			Select("group_key").
+			Group("group_key").
+			Having("COUNT(*) > 1").
+			Pluck("group_key", &verifiedKeys).Error
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		if len(verifiedKeys) != 0 {
+			t.Fatalf("expected 0 verified keys for Batman, got %v", verifiedKeys)
+		}
+	})
+
+	t.Run("按 group_key 特征码模糊检索", func(t *testing.T) {
+		var keys []string
+		err := resultGroupsQuery(taskID, &trueVal, "222").
+			Select("group_key").
+			Group("group_key").
+			Having("COUNT(*) > 1").
+			Pluck("group_key", &keys).Error
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		if len(keys) != 1 || keys[0] != "sha1:222" {
+			t.Fatalf("expected ['sha1:222'], got %v", keys)
+		}
+	})
+
+	t.Run("检索无匹配内容", func(t *testing.T) {
+		var total int64
+		err := resultGroupsQuery(taskID, &trueVal, "NonExistentWord").
+			Select("group_key").
+			Group("group_key").
+			Having("COUNT(*) > 1").
+			Count(&total).Error
+		if err != nil {
+			t.Fatalf("count failed: %v", err)
+		}
+		if total != 0 {
+			t.Fatalf("expected total 0, got %d", total)
+		}
+	})
 }
 
