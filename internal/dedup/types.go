@@ -39,9 +39,26 @@ type DedupTask struct {
 	ExcludeExts      string     `gorm:"size:255" json:"exclude_exts"` // 排除后缀
 	CandidateGroups  int        `json:"candidate_groups"` // 未校验候选组数（不可批量清理）
 	CandidateFiles   int        `json:"candidate_files"`  // 未校验候选文件数
+	IsSnapshot       bool       `json:"is_snapshot"`        // 是否具有完整文件快照
+	SnapshotFiles    int64      `json:"snapshot_files"`     // 快照包含的文件总数
+	BaseTaskID       string     `gorm:"size:36" json:"base_task_id,omitempty"` // 增量扫描或重析来源任务ID
+	Incremental      bool       `json:"incremental"`        // 是否为增量扫描
+	CachedFiles      int64      `json:"cached_files"`       // 增量命中复用缓存的文件数
 	Error            string     `gorm:"type:text" json:"error,omitempty"`
 	StartedAt        time.Time  `json:"started_at"`
 	EndedAt          *time.Time `json:"ended_at,omitempty"`
+}
+
+// DedupSnapshotItem 保存扫描任务发现的所有文件快照（用于快速重析与后续增量比对）
+type DedupSnapshotItem struct {
+	ID       uint      `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID   string    `gorm:"index:idx_snap_task;size:36" json:"task_id"`
+	Path     string    `gorm:"type:text" json:"path"`
+	Name     string    `gorm:"size:512" json:"name"`
+	Size     int64     `gorm:"index:idx_snap_size" json:"size"`
+	Modified time.Time `json:"modified"`
+	HashType string    `gorm:"size:16" json:"hash_type,omitempty"`
+	Hash     string    `gorm:"index:idx_snap_hash;size:128" json:"hash,omitempty"`
 }
 
 // DedupFileItem 已校验重复文件 / 未校验候选文件的记录（持久化到 dedup_file_items 表）
@@ -151,6 +168,8 @@ type ScanConfig struct {
 	MinSize     int64    `json:"min_size"`     // 最小文件大小过滤（字节），<=0 表示不过滤
 	IncludeExts []string `json:"include_exts"` // 仅包含的扩展名（小写，不带点，空表示不过滤）
 	ExcludeExts []string `json:"exclude_exts"` // 排除的扩展名（小写，不带点）
+	Incremental bool     `json:"incremental"`  // 是否启用增量扫描
+	BaseTaskID  string   `json:"base_task_id"` // 基准任务ID（空则自动选择同路径最新快照）
 }
 
 // ==================== 任务进度 ====================
@@ -167,6 +186,8 @@ type ScanStats struct {
 	WastedBytes     int64 `json:"wasted_bytes"`
 	CandidateGroups int   `json:"candidate_groups"`
 	CandidateFiles  int   `json:"candidate_files"`
+	CachedFiles     int64 `json:"cached_files"` // 增量命中复用哈希的文件数
+	CachedBytes     int64 `json:"cached_bytes"` // 增量命中文件总字节数
 }
 
 // Progress 扫描进度计数器。全部使用原子操作，供后台任务与 HTTP 接口并发读取，
@@ -182,6 +203,8 @@ type Progress struct {
 	wastedBytes     atomic.Int64
 	candidateGroups atomic.Int64
 	candidateFiles  atomic.Int64
+	cachedFiles     atomic.Int64
+	cachedBytes     atomic.Int64
 }
 
 // Snapshot 返回当前进度的只读快照
@@ -197,6 +220,8 @@ func (p *Progress) Snapshot() ScanStats {
 		WastedBytes:     p.wastedBytes.Load(),
 		CandidateGroups: int(p.candidateGroups.Load()),
 		CandidateFiles:  int(p.candidateFiles.Load()),
+		CachedFiles:     p.cachedFiles.Load(),
+		CachedBytes:     p.cachedBytes.Load(),
 	}
 }
 
@@ -212,6 +237,8 @@ func (p *Progress) Store(stats ScanStats) {
 	p.wastedBytes.Store(stats.WastedBytes)
 	p.candidateGroups.Store(int64(stats.CandidateGroups))
 	p.candidateFiles.Store(int64(stats.CandidateFiles))
+	p.cachedFiles.Store(stats.CachedFiles)
+	p.cachedBytes.Store(stats.CachedBytes)
 }
 
 // ==================== 数据库操作 ====================
@@ -227,7 +254,7 @@ func Init() {
 // InitDB 自动迁移去重模块的数据库表，并清理旧版本遗留的无效结果行
 func InitDB() {
 	d := db.GetDb()
-	if err := d.AutoMigrate(&DedupTask{}, &DedupFileItem{}, &DedupDirStat{}); err != nil {
+	if err := d.AutoMigrate(&DedupTask{}, &DedupFileItem{}, &DedupDirStat{}, &DedupSnapshotItem{}); err != nil {
 		log.Errorf("[dedup] failed to migrate database: %v", err)
 		return
 	}
@@ -392,14 +419,108 @@ func GroupMembers(taskID string, groupKeys []string) (map[string][]string, error
 	return members, nil
 }
 
-// DeleteFileItems 从结果明细中移除已成功删除的文件
+// SaveSnapshotFiles 将扫描发现的所有文件快照持久化到数据库
+func SaveSnapshotFiles(taskID string, files []FileItem) error {
+	if len(files) == 0 {
+		return nil
+	}
+	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("task_id = ?", taskID).Delete(&DedupSnapshotItem{}).Error; err != nil {
+			return err
+		}
+		batch := make([]DedupSnapshotItem, 0, 1000)
+		flush := func() error {
+			if len(batch) == 0 {
+				return nil
+			}
+			if err := tx.CreateInBatches(batch, len(batch)).Error; err != nil {
+				return err
+			}
+			batch = batch[:0]
+			return nil
+		}
+		for _, f := range files {
+			batch = append(batch, DedupSnapshotItem{
+				TaskID:   taskID,
+				Path:     f.Path,
+				Name:     f.Name,
+				Size:     f.Size,
+				Modified: f.Modified,
+				HashType: f.HashType,
+				Hash:     f.Hash,
+			})
+			if len(batch) >= 1000 {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+		}
+		return flush()
+	})
+	if err != nil {
+		log.Errorf("[dedup] failed to save snapshot files of task %s: %v", taskID, err)
+	}
+	return err
+}
+
+// GetSnapshotFiles 读取指定任务的完整文件快照
+func GetSnapshotFiles(taskID string) ([]DedupSnapshotItem, error) {
+	var items []DedupSnapshotItem
+	if err := db.GetDb().Where("task_id = ?", taskID).Find(&items).Error; err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// CopySnapshotFiles 将源任务的快照复制给新任务
+func CopySnapshotFiles(sourceTaskID, targetTaskID string) error {
+	return db.GetDb().Transaction(func(tx *gorm.DB) error {
+		var count int64
+		if err := tx.Model(&DedupSnapshotItem{}).Where("task_id = ?", sourceTaskID).Count(&count).Error; err != nil {
+			return err
+		}
+		if count == 0 {
+			return nil
+		}
+		batchSize := 2000
+		for offset := 0; int64(offset) < count; offset += batchSize {
+			var batch []DedupSnapshotItem
+			if err := tx.Where("task_id = ?", sourceTaskID).
+				Offset(offset).Limit(batchSize).
+				Find(&batch).Error; err != nil {
+				return err
+			}
+			newBatch := make([]DedupSnapshotItem, len(batch))
+			for i, item := range batch {
+				newBatch[i] = DedupSnapshotItem{
+					TaskID:   targetTaskID,
+					Path:     item.Path,
+					Name:     item.Name,
+					Size:     item.Size,
+					Modified: item.Modified,
+					HashType: item.HashType,
+					Hash:     item.Hash,
+				}
+			}
+			if err := tx.CreateInBatches(newBatch, len(newBatch)).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// DeleteFileItems 从结果明细中移除已成功删除的文件，同时同步移除快照中的对应条目
 func DeleteFileItems(taskID string, paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
-	return db.GetDb().
-		Where("task_id = ? AND path IN ?", taskID, paths).
-		Delete(&DedupFileItem{}).Error
+	return db.GetDb().Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("task_id = ? AND path IN ?", taskID, paths).Delete(&DedupFileItem{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("task_id = ? AND path IN ?", taskID, paths).Delete(&DedupSnapshotItem{}).Error
+	})
 }
 
 // DropDanglingGroups 清掉清理后只剩 1 个成员的分组（已不构成重复）

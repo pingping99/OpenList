@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
@@ -229,15 +230,68 @@ func defaultDirLister(ctx context.Context, dir string) ([]model.Obj, error) {
 // 阶段一：遍历目录，按「文件大小」粗筛，同时记录每个文件的哈希（可校验）或
 // 「同名同尺寸」（不可校验候选）；
 // 阶段二：同尺寸文件按哈希精确聚合，产出 verified 分组；无哈希文件按同名同尺寸
+type fileCacheItem struct {
+	Size     int64
+	Modified time.Time
+	HashType string
+	Hash     string
+}
+
+func loadFileCache(rootPath, baseTaskID string) map[string]fileCacheItem {
+	d := db.GetDb()
+	targetTaskID := baseTaskID
+	if targetTaskID == "" {
+		var latestTask DedupTask
+		if err := d.Where("root_path = ? AND state = ? AND (is_snapshot = ? OR snapshot_files > 0)", rootPath, "finished", true).
+			Order("started_at DESC").First(&latestTask).Error; err == nil {
+			targetTaskID = latestTask.ID
+		}
+	}
+	if targetTaskID == "" {
+		return nil
+	}
+
+	var items []DedupSnapshotItem
+	if err := d.Where("task_id = ?", targetTaskID).Find(&items).Error; err != nil {
+		log.Warnf("[dedup] failed to load snapshot items for base task %s: %v", targetTaskID, err)
+		return nil
+	}
+	if len(items) == 0 {
+		return nil
+	}
+
+	cache := make(map[string]fileCacheItem, len(items))
+	for _, it := range items {
+		cache[it.Path] = fileCacheItem{
+			Size:     it.Size,
+			Modified: it.Modified,
+			HashType: it.HashType,
+			Hash:     it.Hash,
+		}
+	}
+	log.Infof("[dedup] loaded %d snapshot cache items from base task %s for %s", len(cache), targetTaskID, rootPath)
+	return cache
+}
+
+// Scan 执行有界并发、限速、两阶段过滤的查重扫描。
+//
+// 阶段一：遍历目录，按「文件大小」粗筛，同时记录每个文件的哈希（可校验）或
+// 「同名同尺寸」（不可校验候选）；
+// 阶段二：同尺寸文件按哈希精确聚合，产出 verified 分组；无哈希文件按同名同尺寸
 // 产出 candidate 分组。candidate 仅供人工确认，不参与批量清理。
-func Scan(ctx context.Context, cfg ScanConfig, p *Progress) ([]DupGroup, map[string]*DirStat, error) {
+func Scan(ctx context.Context, cfg ScanConfig, p *Progress) ([]DupGroup, map[string]*DirStat, []FileItem, error) {
 	return scan(ctx, cfg, p, defaultDirLister)
 }
 
-func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([]DupGroup, map[string]*DirStat, error) {
+func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([]DupGroup, map[string]*DirStat, []FileItem, error) {
 	cfg = normalizeScanConfig(cfg)
 	limiter := rate.NewLimiter(rate.Limit(cfg.QPS), 1)
 	queue := newDirWorkQueue()
+
+	var fileCache map[string]fileCacheItem
+	if cfg.Incremental {
+		fileCache = loadFileCache(cfg.RootPath, cfg.BaseTaskID)
+	}
 
 	stopWatch := make(chan struct{})
 	go func() {
@@ -254,12 +308,15 @@ func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([
 		sizeBuckets = make(map[int64]map[string][]FileItem) // size -> groupKey -> files（可校验）
 		candidates  = make(map[string][]FileItem)           // groupKey -> files（不可校验候选）
 		dirStats    = make(map[string]*DirStat)
+		allFiles    []FileItem                              // 保存全量探测到的文件（用于快照持久化）
 	)
 
 	classify := func(dir string, objs []model.Obj, depth int) {
 		var verified, unverified []FileItem
 		var dirFileCount int
 		var dirTotalSize int64
+		var currentDirFiles []FileItem
+
 		for _, obj := range objs {
 			if obj.IsDir() {
 				if depth < cfg.MaxDepth {
@@ -269,6 +326,30 @@ func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([
 			}
 			dirFileCount++
 			dirTotalSize += obj.GetSize()
+
+			filePath := path.Join(dir, obj.GetName())
+			item := FileItem{
+				Path:     filePath,
+				Name:     obj.GetName(),
+				Size:     obj.GetSize(),
+				Modified: obj.ModTime(),
+			}
+			item.HashType, item.Hash = resolveHash(obj)
+
+			// 增量哈希匹配：若大小与修改时间一致，复用历史哈希并记录增量命中
+			if fileCache != nil {
+				if cached, ok := fileCache[filePath]; ok && cached.Size == item.Size && cached.Modified.Equal(item.Modified) {
+					if item.Hash == "" && cached.Hash != "" {
+						item.HashType = cached.HashType
+						item.Hash = cached.Hash
+					}
+					p.cachedFiles.Add(1)
+					p.cachedBytes.Add(item.Size)
+				}
+			}
+
+			currentDirFiles = append(currentDirFiles, item)
+
 			if cfg.MinSize > 0 && obj.GetSize() < cfg.MinSize {
 				continue
 			}
@@ -297,13 +378,7 @@ func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([
 					continue
 				}
 			}
-			item := FileItem{
-				Path:     path.Join(dir, obj.GetName()),
-				Name:     obj.GetName(),
-				Size:     obj.GetSize(),
-				Modified: obj.ModTime(),
-			}
-			item.HashType, item.Hash = resolveHash(obj)
+
 			if item.Hash != "" {
 				verified = append(verified, item)
 			} else if item.Size > 0 {
@@ -318,6 +393,7 @@ func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([
 		}
 		dirStats[dir].FileCount += dirFileCount
 		dirStats[dir].TotalSize += dirTotalSize
+		allFiles = append(allFiles, currentDirFiles...)
 		mu.Unlock()
 
 		if len(verified) > 0 {
@@ -351,7 +427,7 @@ func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([
 	// 0 组重复」的假成功（旧实现只打一条 Warn 日志）。
 	rootObjs, err := listWithRetry(ctx, limiter, lister, cfg.RootPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("无法列举根目录 %s: %w", cfg.RootPath, err)
+		return nil, nil, nil, fmt.Errorf("无法列举根目录 %s: %w", cfg.RootPath, err)
 	}
 	p.scannedDirs.Add(1)
 	classify(cfg.RootPath, rootObjs, 0)
@@ -389,7 +465,7 @@ func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([
 	wg.Wait()
 
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// ========== 第二阶段：按哈希精确聚合 ==========
@@ -452,7 +528,7 @@ func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([
 	}
 	p.Store(stats)
 
-	return groups, dirStats, nil
+	return groups, dirStats, allFiles, nil
 }
 
 func sortByModified(files []FileItem) {

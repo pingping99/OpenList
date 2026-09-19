@@ -23,4 +23,5 @@ func RegisterRouter(g *gin.RouterGroup) {
 	g.GET("/history/:id", HandleGetHistoryDetail)
 	g.DELETE("/history/:id", HandleDeleteHistory)
 	g.POST("/history/clear-empty", HandleClearEmptyHistory)
+	g.POST("/reanalyze", HandleReanalyze)
 }

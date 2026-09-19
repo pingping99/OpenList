@@ -21,6 +21,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/OpenListTeam/tache"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
@@ -34,6 +35,8 @@ type StartReq struct {
 	MinSize     int64    `json:"min_size"`
 	IncludeExts []string `json:"include_exts"`
 	ExcludeExts []string `json:"exclude_exts"`
+	Incremental bool     `json:"incremental"`
+	BaseTaskID  string   `json:"base_task_id"`
 }
 
 type RemoveReq struct {
@@ -74,16 +77,21 @@ func canManageTask(user *model.User, task *DedupTask) bool {
 // StatusView 是任务状态的统一响应结构，running（tache 内存）与历史（数据库）两种来源
 // 都映射到同一个结构，避免前端需要兼容多种字段形态
 type StatusView struct {
-	ID        string     `json:"id"`
-	TaskID    string     `json:"task_id"`
-	RootPath  string     `json:"root_path"`
-	State     string     `json:"state"`
-	Status    string     `json:"status"`
-	Progress  float64    `json:"progress"`
-	Stats     ScanStats  `json:"stats"`
-	StartTime *time.Time `json:"start_time,omitempty"`
-	EndTime   *time.Time `json:"end_time,omitempty"`
-	Error     string     `json:"error,omitempty"`
+	ID            string     `json:"id"`
+	TaskID        string     `json:"task_id"`
+	RootPath      string     `json:"root_path"`
+	State         string     `json:"state"`
+	Status        string     `json:"status"`
+	Progress      float64    `json:"progress"`
+	Stats         ScanStats  `json:"stats"`
+	StartTime     *time.Time `json:"start_time,omitempty"`
+	EndTime       *time.Time `json:"end_time,omitempty"`
+	Error         string     `json:"error,omitempty"`
+	IsSnapshot    bool       `json:"is_snapshot"`
+	SnapshotFiles int64      `json:"snapshot_files"`
+	CachedFiles   int64      `json:"cached_files"`
+	Incremental   bool       `json:"incremental"`
+	BaseTaskID    string     `json:"base_task_id,omitempty"`
 }
 
 // ==================== 扫描任务 ====================
@@ -128,6 +136,8 @@ func HandleStartScan(c *gin.Context) {
 		MinSize:     req.MinSize,
 		IncludeExts: req.IncludeExts,
 		ExcludeExts: req.ExcludeExts,
+		Incremental: req.Incremental,
+		BaseTaskID:  req.BaseTaskID,
 	})
 
 	// 同一个目录不允许并发重复扫描
@@ -179,15 +189,18 @@ func HandleGetStatus(c *gin.Context) {
 				t := running[0]
 				snap := t.Snapshot()
 				common.SuccessResp(c, StatusView{
-					ID:        t.GetID(),
-					TaskID:    t.GetID(),
-					RootPath:  t.Config.RootPath,
-					State:     snap.State,
-					Status:    snap.Status,
-					Progress:  snap.Progress,
-					Stats:     snap.Stats,
-					StartTime: t.GetStartTime(),
-					EndTime:   t.GetEndTime(),
+					ID:            t.GetID(),
+					TaskID:        t.GetID(),
+					RootPath:      t.Config.RootPath,
+					State:         snap.State,
+					Status:        snap.Status,
+					Progress:      snap.Progress,
+					Stats:         snap.Stats,
+					StartTime:     t.GetStartTime(),
+					EndTime:       t.GetEndTime(),
+					CachedFiles:   snap.Stats.CachedFiles,
+					Incremental:   t.Config.Incremental,
+					BaseTaskID:    t.Config.BaseTaskID,
 				})
 				return
 			}
@@ -217,15 +230,18 @@ func HandleGetStatus(c *gin.Context) {
 			}
 			snap := t.Snapshot()
 			common.SuccessResp(c, StatusView{
-				ID:        t.GetID(),
-				TaskID:    t.GetID(),
-				RootPath:  t.Config.RootPath,
-				State:     snap.State,
-				Status:    snap.Status,
-				Progress:  snap.Progress,
-				Stats:     snap.Stats,
-				StartTime: t.GetStartTime(),
-				EndTime:   t.GetEndTime(),
+				ID:            t.GetID(),
+				TaskID:        t.GetID(),
+				RootPath:      t.Config.RootPath,
+				State:         snap.State,
+				Status:        snap.Status,
+				Progress:      snap.Progress,
+				Stats:         snap.Stats,
+				StartTime:     t.GetStartTime(),
+				EndTime:       t.GetEndTime(),
+				CachedFiles:   snap.Stats.CachedFiles,
+				Incremental:   t.Config.Incremental,
+				BaseTaskID:    t.Config.BaseTaskID,
 			})
 			return
 		}
@@ -256,10 +272,15 @@ func taskRecord(t *DedupScanTask) *DedupTask {
 
 func statusViewFromTask(task *DedupTask) StatusView {
 	view := StatusView{
-		ID:       task.ID,
-		TaskID:   task.ID,
-		RootPath: task.RootPath,
-		State:    task.State,
+		ID:            task.ID,
+		TaskID:        task.ID,
+		RootPath:      task.RootPath,
+		State:         task.State,
+		IsSnapshot:    task.IsSnapshot,
+		SnapshotFiles: task.SnapshotFiles,
+		CachedFiles:   task.CachedFiles,
+		Incremental:   task.Incremental,
+		BaseTaskID:    task.BaseTaskID,
 		Stats: ScanStats{
 			ScannedDirs:     task.ScannedDirs,
 			ScannedFiles:    task.ScannedFiles,
@@ -271,6 +292,7 @@ func statusViewFromTask(task *DedupTask) StatusView {
 			WastedBytes:     task.WastedTotal,
 			CandidateGroups: task.CandidateGroups,
 			CandidateFiles:  task.CandidateFiles,
+			CachedFiles:     task.CachedFiles,
 		},
 		StartTime: &task.StartedAt,
 		EndTime:   task.EndedAt,
@@ -534,6 +556,12 @@ func HandleDeleteHistory(c *gin.Context) {
 		return
 	}
 	if err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("task_id = ?", task.ID).Delete(&DedupSnapshotItem{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("task_id = ?", task.ID).Delete(&DedupDirStat{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Where("task_id = ?", task.ID).Delete(&DedupFileItem{}).Error; err != nil {
 			return err
 		}
@@ -567,6 +595,12 @@ func HandleClearEmptyHistory(c *gin.Context) {
 		return
 	}
 	if err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("task_id IN ?", targetIDs).Delete(&DedupSnapshotItem{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("task_id IN ?", targetIDs).Delete(&DedupDirStat{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Where("task_id IN ?", targetIDs).Delete(&DedupFileItem{}).Error; err != nil {
 			return err
 		}
@@ -577,6 +611,231 @@ func HandleClearEmptyHistory(c *gin.Context) {
 	}
 	InvalidateFolderPairsCache(targetIDs...)
 	common.SuccessResp(c, gin.H{"deleted": len(targetIDs), "deleted_count": len(targetIDs)})
+}
+
+type ReanalyzeReq struct {
+	TaskID      string   `json:"task_id"`
+	MinSize     int64    `json:"min_size"`
+	IncludeExts []string `json:"include_exts"`
+	ExcludeExts []string `json:"exclude_exts"`
+}
+
+// HandleReanalyze 基于历史快照在毫秒级内重新计算查重结果（无需再次访问远端服务器）
+func HandleReanalyze(c *gin.Context) {
+	user := currentUser(c)
+	if user == nil {
+		common.ErrorStrResp(c, "未登录", http.StatusUnauthorized)
+		return
+	}
+	var req ReanalyzeReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest)
+		return
+	}
+	if req.TaskID == "" {
+		common.ErrorStrResp(c, "缺少 task_id", http.StatusBadRequest)
+		return
+	}
+
+	task, err := GetTaskByID(req.TaskID)
+	if err != nil {
+		common.ErrorStrResp(c, "任务不存在", http.StatusNotFound)
+		return
+	}
+	if !canManageTask(user, task) {
+		common.ErrorStrResp(c, "无权操作该任务", http.StatusForbidden)
+		return
+	}
+
+	snapshotItems, err := GetSnapshotFiles(task.ID)
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusInternalServerError, true)
+		return
+	}
+	if len(snapshotItems) == 0 {
+		common.ErrorStrResp(c, "该任务未包含完整文件快照，请重新发起一次扫描", http.StatusBadRequest)
+		return
+	}
+
+	minSize := req.MinSize
+	if minSize < 0 {
+		minSize = 0
+	}
+	incExts := cleanExtList(req.IncludeExts)
+	excExts := cleanExtList(req.ExcludeExts)
+
+	sizeBuckets := make(map[int64]map[string][]FileItem)
+	candidates := make(map[string][]FileItem)
+	dirStats := make(map[string]*DirStat)
+	var matchedFiles []FileItem
+	var verifiedCount, unverifiedCount int64
+
+	for _, item := range snapshotItems {
+		dir := path.Dir(item.Path)
+		if dirStats[dir] == nil {
+			dirStats[dir] = &DirStat{Path: dir}
+		}
+		dirStats[dir].FileCount++
+		dirStats[dir].TotalSize += item.Size
+
+		if minSize > 0 && item.Size < minSize {
+			continue
+		}
+		ext := strings.ToLower(strings.TrimPrefix(path.Ext(item.Name), "."))
+		if len(incExts) > 0 {
+			matched := false
+			for _, ie := range incExts {
+				if ext == ie {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+		if len(excExts) > 0 {
+			excluded := false
+			for _, ee := range excExts {
+				if ext == ee {
+					excluded = true
+					break
+				}
+			}
+			if excluded {
+				continue
+			}
+		}
+
+		fi := FileItem{
+			Path:     item.Path,
+			Name:     item.Name,
+			Size:     item.Size,
+			HashType: item.HashType,
+			Hash:     item.Hash,
+			Modified: item.Modified,
+		}
+		matchedFiles = append(matchedFiles, fi)
+
+		if fi.Hash != "" {
+			verifiedCount++
+			byHash, ok := sizeBuckets[fi.Size]
+			if !ok {
+				byHash = make(map[string][]FileItem)
+				sizeBuckets[fi.Size] = byHash
+			}
+			key := verifiedGroupKey(fi.HashType, fi.Hash)
+			byHash[key] = append(byHash[key], fi)
+		} else if fi.Size > 0 {
+			unverifiedCount++
+			key := candidateGroupKey(fi.Name, fi.Size)
+			candidates[key] = append(candidates[key], fi)
+		}
+	}
+
+	var groups []DupGroup
+	var dupGroups, dupFiles, candidateGroups, candidateFiles int
+	var wastedTotal int64
+
+	for size, byHash := range sizeBuckets {
+		for key, files := range byHash {
+			if len(files) < 2 {
+				continue
+			}
+			sortByModified(files)
+			wasted := size * int64(len(files)-1)
+			dupGroups++
+			dupFiles += len(files)
+			wastedTotal += wasted
+			groups = append(groups, DupGroup{
+				GroupKey:    key,
+				HashType:    files[0].HashType,
+				Hash:        files[0].Hash,
+				Size:        size,
+				Verified:    true,
+				WastedBytes: wasted,
+				Files:       files,
+			})
+		}
+	}
+	for key, files := range candidates {
+		if len(files) < 2 {
+			continue
+		}
+		sortByModified(files)
+		candidateGroups++
+		candidateFiles += len(files)
+		groups = append(groups, DupGroup{
+			GroupKey:    key,
+			Size:        files[0].Size,
+			Verified:    false,
+			WastedBytes: files[0].Size * int64(len(files)-1),
+			Files:       files,
+		})
+	}
+
+	sort.Slice(groups, func(i, j int) bool {
+		if groups[i].Verified != groups[j].Verified {
+			return groups[i].Verified
+		}
+		if groups[i].WastedBytes != groups[j].WastedBytes {
+			return groups[i].WastedBytes > groups[j].WastedBytes
+		}
+		return groups[i].GroupKey < groups[j].GroupKey
+	})
+
+	newID := uuid.NewString()
+	now := time.Now()
+	newTask := &DedupTask{
+		ID:               newID,
+		RootPath:         task.RootPath,
+		State:            "finished",
+		Creator:          user.Username,
+		CreatorID:        user.ID,
+		ScannedDirs:      int64(len(dirStats)),
+		ScannedFiles:     int64(len(matchedFiles)),
+		VerifiedFiles:    verifiedCount,
+		UnverifiedFiles:  unverifiedCount,
+		FailedDirs:       0,
+		DupGroups:        dupGroups,
+		DupFiles:         dupFiles,
+		WastedTotal:      wastedTotal,
+		InitialDupGroups: dupGroups,
+		InitialDupFiles:  dupFiles,
+		InitialWasted:    wastedTotal,
+		CleanedFiles:     0,
+		CleanedBytes:     0,
+		MaxDepth:         task.MaxDepth,
+		Concurrency:      task.Concurrency,
+		QPS:              task.QPS,
+		MinSize:          minSize,
+		IncludeExts:      strings.Join(incExts, ","),
+		ExcludeExts:      strings.Join(excExts, ","),
+		CandidateGroups:  candidateGroups,
+		CandidateFiles:   candidateFiles,
+		IsSnapshot:       true,
+		SnapshotFiles:    int64(len(snapshotItems)),
+		BaseTaskID:       task.ID,
+		Incremental:      false,
+		StartedAt:        now,
+		EndedAt:          &now,
+	}
+
+	SaveTask(newTask)
+	SaveDupFiles(newID, groups)
+	SaveDirStats(newID, dirStats)
+	_ = CopySnapshotFiles(task.ID, newID)
+	InvalidateFolderPairsCache(newID)
+
+	common.SuccessResp(c, gin.H{
+		"task_id":          newID,
+		"dup_groups":       dupGroups,
+		"dup_files":        dupFiles,
+		"wasted_total":     wastedTotal,
+		"candidate_groups": candidateGroups,
+		"candidate_files":  candidateFiles,
+		"snapshot_files":   len(snapshotItems),
+	})
 }
 
 // HandleGetDuplicateFolders 查询指定任务中重合度大于指定阈值的重复文件夹对（支持分页与关键词过滤）

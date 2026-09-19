@@ -177,6 +177,7 @@ func (t *DedupScanTask) Run() error {
 					"wasted_total":     snap.WastedBytes,
 					"candidate_groups": snap.CandidateGroups,
 					"candidate_files":  snap.CandidateFiles,
+					"cached_files":     snap.CachedFiles,
 				})
 			case <-reportDone:
 				return
@@ -184,7 +185,7 @@ func (t *DedupScanTask) Run() error {
 		}
 	}()
 
-	groups, dirStats, err := Scan(ctx, t.Config, progress)
+	groups, dirStats, allFiles, err := Scan(ctx, t.Config, progress)
 	close(reportDone)
 	reportWG.Wait() // 等上报协程退出，避免它在终态统计之后再次覆写状态
 
@@ -220,6 +221,7 @@ func (t *DedupScanTask) Run() error {
 		}
 		SaveDupFiles(t.GetID(), groups)
 		SaveDirStats(t.GetID(), dirStats)
+		SaveSnapshotFiles(t.GetID(), allFiles)
 	}
 
 	SaveTask(&DedupTask{
@@ -249,6 +251,11 @@ func (t *DedupScanTask) Run() error {
 		ExcludeExts:      strings.Join(t.Config.ExcludeExts, ","),
 		CandidateGroups:  stats.CandidateGroups,
 		CandidateFiles:   stats.CandidateFiles,
+		IsSnapshot:       len(allFiles) > 0,
+		SnapshotFiles:    int64(len(allFiles)),
+		BaseTaskID:       t.Config.BaseTaskID,
+		Incremental:      t.Config.Incremental,
+		CachedFiles:      stats.CachedFiles,
 		Error:            taskErr,
 		StartedAt:        now,
 		EndedAt:          &end,
