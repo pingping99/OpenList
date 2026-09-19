@@ -564,6 +564,67 @@ func HandleClearEmptyHistory(c *gin.Context) {
 	common.SuccessResp(c, gin.H{"deleted": len(targetIDs), "deleted_count": len(targetIDs)})
 }
 
+// HandleGetDuplicateFolders 查询指定任务中重合度大于指定阈值的重复文件夹对
+func HandleGetDuplicateFolders(c *gin.Context) {
+	user := currentUser(c)
+	taskID := c.Query("task_id")
+	if taskID == "" {
+		common.ErrorStrResp(c, "缺少 task_id", http.StatusBadRequest)
+		return
+	}
+	task, err := GetTaskByID(taskID)
+	if err != nil {
+		common.ErrorStrResp(c, "任务不存在", http.StatusNotFound)
+		return
+	}
+	if !canManageTask(user, task) {
+		common.ErrorStrResp(c, "无权查看该任务", http.StatusForbidden)
+		return
+	}
+
+	thresholdStr := c.DefaultQuery("threshold", "0.3")
+	threshold, err := strconv.ParseFloat(thresholdStr, 64)
+	if err != nil || threshold <= 0 {
+		threshold = 0.3
+	}
+
+	pairs, err := FindDuplicateFolders(taskID, threshold)
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusInternalServerError, true)
+		return
+	}
+
+	common.SuccessResp(c, gin.H{
+		"task_id":   taskID,
+		"threshold": threshold,
+		"total":     len(pairs),
+		"folders":   pairs,
+	})
+}
+
+// HandleMergeFolders 一键合并两个文件夹
+func HandleMergeFolders(c *gin.Context) {
+	user := currentUser(c)
+	if user == nil {
+		common.ErrorStrResp(c, "未登录", http.StatusUnauthorized)
+		return
+	}
+
+	var req MergeFoldersReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest)
+		return
+	}
+
+	resp, err := MergeFolders(c.Request.Context(), user, req)
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest, true)
+		return
+	}
+
+	common.SuccessResp(c, resp)
+}
+
 // ==================== 清理 ====================
 
 // 常见媒体附属文件后缀

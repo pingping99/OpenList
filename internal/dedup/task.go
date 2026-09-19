@@ -184,7 +184,7 @@ func (t *DedupScanTask) Run() error {
 		}
 	}()
 
-	groups, err := Scan(ctx, t.Config, progress)
+	groups, dirStats, err := Scan(ctx, t.Config, progress)
 	close(reportDone)
 	reportWG.Wait() // 等上报协程退出，避免它在终态统计之后再次覆写状态
 
@@ -219,6 +219,7 @@ func (t *DedupScanTask) Run() error {
 				t.GetID(), stats.UnverifiedFiles)
 		}
 		SaveDupFiles(t.GetID(), groups)
+		SaveDirStats(t.GetID(), dirStats)
 	}
 
 	SaveTask(&DedupTask{

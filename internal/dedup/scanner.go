@@ -230,11 +230,11 @@ func defaultDirLister(ctx context.Context, dir string) ([]model.Obj, error) {
 // 「同名同尺寸」（不可校验候选）；
 // 阶段二：同尺寸文件按哈希精确聚合，产出 verified 分组；无哈希文件按同名同尺寸
 // 产出 candidate 分组。candidate 仅供人工确认，不参与批量清理。
-func Scan(ctx context.Context, cfg ScanConfig, p *Progress) ([]DupGroup, error) {
+func Scan(ctx context.Context, cfg ScanConfig, p *Progress) ([]DupGroup, map[string]*DirStat, error) {
 	return scan(ctx, cfg, p, defaultDirLister)
 }
 
-func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([]DupGroup, error) {
+func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([]DupGroup, map[string]*DirStat, error) {
 	cfg = normalizeScanConfig(cfg)
 	limiter := rate.NewLimiter(rate.Limit(cfg.QPS), 1)
 	queue := newDirWorkQueue()
@@ -253,10 +253,13 @@ func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([
 		mu          sync.Mutex
 		sizeBuckets = make(map[int64]map[string][]FileItem) // size -> groupKey -> files（可校验）
 		candidates  = make(map[string][]FileItem)           // groupKey -> files（不可校验候选）
+		dirStats    = make(map[string]*DirStat)
 	)
 
 	classify := func(dir string, objs []model.Obj, depth int) {
 		var verified, unverified []FileItem
+		var dirFileCount int
+		var dirTotalSize int64
 		for _, obj := range objs {
 			if obj.IsDir() {
 				if depth < cfg.MaxDepth {
@@ -264,6 +267,8 @@ func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([
 				}
 				continue
 			}
+			dirFileCount++
+			dirTotalSize += obj.GetSize()
 			if cfg.MinSize > 0 && obj.GetSize() < cfg.MinSize {
 				continue
 			}
@@ -307,6 +312,14 @@ func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([
 			}
 		}
 
+		mu.Lock()
+		if dirStats[dir] == nil {
+			dirStats[dir] = &DirStat{Path: dir}
+		}
+		dirStats[dir].FileCount += dirFileCount
+		dirStats[dir].TotalSize += dirTotalSize
+		mu.Unlock()
+
 		if len(verified) > 0 {
 			mu.Lock()
 			for _, f := range verified {
@@ -338,7 +351,7 @@ func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([
 	// 0 组重复」的假成功（旧实现只打一条 Warn 日志）。
 	rootObjs, err := listWithRetry(ctx, limiter, lister, cfg.RootPath)
 	if err != nil {
-		return nil, fmt.Errorf("无法列举根目录 %s: %w", cfg.RootPath, err)
+		return nil, nil, fmt.Errorf("无法列举根目录 %s: %w", cfg.RootPath, err)
 	}
 	p.scannedDirs.Add(1)
 	classify(cfg.RootPath, rootObjs, 0)
@@ -376,7 +389,7 @@ func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([
 	wg.Wait()
 
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// ========== 第二阶段：按哈希精确聚合 ==========
@@ -439,7 +452,7 @@ func scan(ctx context.Context, cfg ScanConfig, p *Progress, lister dirLister) ([
 	}
 	p.Store(stats)
 
-	return groups, nil
+	return groups, dirStats, nil
 }
 
 func sortByModified(files []FileItem) {

@@ -69,7 +69,7 @@ func TestScan_VerifiedGroupingAndP0_2(t *testing.T) {
 	}
 
 	progress := &Progress{}
-	groups, err := scan(context.Background(), ScanConfig{RootPath: "/", Concurrency: 4, QPS: 1000}, progress, fakeLister(tree))
+	groups, _, err := scan(context.Background(), ScanConfig{RootPath: "/", Concurrency: 4, QPS: 1000}, progress, fakeLister(tree))
 	if err != nil {
 		t.Fatalf("scan failed: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestScan_NoHashStorageNeverReportsDuplicates(t *testing.T) {
 		"/b": {fileObj("z.mkv", 100, nil, "")},
 	}
 	progress := &Progress{}
-	groups, err := scan(context.Background(), ScanConfig{RootPath: "/", Concurrency: 2}, progress, fakeLister(tree))
+	groups, _, err := scan(context.Background(), ScanConfig{RootPath: "/", Concurrency: 2}, progress, fakeLister(tree))
 	if err != nil {
 		t.Fatalf("scan failed: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestScan_GCIDPreferred(t *testing.T) {
 		"/b": {fileObj("m.mkv", 10, utils.MD5, md5v)},
 	}
 	progress := &Progress{}
-	groups, err := scan(context.Background(), ScanConfig{RootPath: "/"}, progress, fakeLister(tree))
+	groups, _, err := scan(context.Background(), ScanConfig{RootPath: "/"}, progress, fakeLister(tree))
 	if err != nil {
 		t.Fatalf("scan failed: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestScan_RootFailureIsFatal(t *testing.T) {
 		return nil, errors.New("boom")
 	}
 	progress := &Progress{}
-	if _, err := scan(context.Background(), ScanConfig{RootPath: "/missing"}, progress, lister); err == nil {
+	if _, _, err := scan(context.Background(), ScanConfig{RootPath: "/missing"}, progress, lister); err == nil {
 		t.Fatal("根目录列举失败时应返回错误")
 	}
 }
@@ -190,7 +190,7 @@ func TestScan_SubDirFailureCounted(t *testing.T) {
 		"/a": {fileObj("m.mkv", 10, utils.MD5, "aaaa"), fileObj("m2.mkv", 10, utils.MD5, "aaaa")},
 	}
 	progress := &Progress{}
-	groups, err := scan(context.Background(), ScanConfig{RootPath: "/", Concurrency: 2}, progress, fakeLister(tree))
+	groups, _, err := scan(context.Background(), ScanConfig{RootPath: "/", Concurrency: 2}, progress, fakeLister(tree))
 	if err != nil {
 		t.Fatalf("子目录失败不应使任务失败: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestScan_MaxDepth(t *testing.T) {
 		"/a/b": {fileObj("x.mkv", 1, utils.MD5, "aaaa"), fileObj("y.mkv", 1, utils.MD5, "aaaa")},
 	}
 	progress := &Progress{}
-	groups, err := scan(context.Background(), ScanConfig{RootPath: "/", MaxDepth: 1, Concurrency: 2}, progress, fakeLister(tree))
+	groups, _, err := scan(context.Background(), ScanConfig{RootPath: "/", MaxDepth: 1, Concurrency: 2}, progress, fakeLister(tree))
 	if err != nil {
 		t.Fatalf("scan failed: %v", err)
 	}

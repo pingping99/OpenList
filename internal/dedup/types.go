@@ -58,6 +58,67 @@ type DedupFileItem struct {
 	Modified time.Time `json:"modified"`
 }
 
+// DedupDirStat 记录扫描时各目录的文件总量与总大小（持久化到 dedup_dir_stats 表）
+type DedupDirStat struct {
+	ID        uint   `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID    string `gorm:"index:idx_task_dir;size:36" json:"task_id"`
+	Path      string `gorm:"index:idx_task_dir;size:1024" json:"path"`
+	FileCount int    `json:"file_count"`
+	TotalSize int64  `json:"total_size"`
+}
+
+// DirStat 扫描时内存中暂存的单目录统计
+type DirStat struct {
+	Path      string `json:"path"`
+	FileCount int    `json:"file_count"`
+	TotalSize int64  `json:"total_size"`
+}
+
+// DupFolderMatchedFile 两个重复文件夹中匹配的单组文件
+type DupFolderMatchedFile struct {
+	PathA    string `json:"path_a"`
+	PathB    string `json:"path_b"`
+	NameA    string `json:"name_a"`
+	NameB    string `json:"name_b"`
+	Size     int64  `json:"size"`
+	GroupKey string `json:"group_key"`
+}
+
+// DupFolderPair 重复文件夹对
+type DupFolderPair struct {
+	DirA          string                 `json:"dir_a"`
+	DirB          string                 `json:"dir_b"`
+	TotalFilesA   int                    `json:"total_files_a"`
+	TotalFilesB   int                    `json:"total_files_b"`
+	TotalSizeA    int64                  `json:"total_size_a"`
+	TotalSizeB    int64                  `json:"total_size_b"`
+	DupFilesCount int                    `json:"dup_files_count"`
+	DupFilesSize  int64                  `json:"dup_files_size"`
+	RatioA        float64                `json:"ratio_a"`
+	RatioB        float64                `json:"ratio_b"`
+	Similarity    float64                `json:"similarity"`
+	MatchedFiles  []DupFolderMatchedFile `json:"matched_files,omitempty"`
+}
+
+// MergeFoldersReq 一键合并请求
+type MergeFoldersReq struct {
+	TaskID           string `json:"task_id"`
+	SourceDir        string `json:"source_dir"`
+	TargetDir        string `json:"target_dir"`
+	ConflictStrategy string `json:"conflict_strategy"` // "rename", "skip", "overwrite"
+}
+
+// MergeFoldersResp 一键合并返回
+type MergeFoldersResp struct {
+	SourceDir        string   `json:"source_dir"`
+	TargetDir        string   `json:"target_dir"`
+	DeletedDupFiles  int      `json:"deleted_dup_files"`
+	MovedUniqueFiles int      `json:"moved_unique_files"`
+	ReclaimedBytes   int64    `json:"reclaimed_bytes"`
+	SourceRemoved    bool     `json:"source_removed"`
+	Errors           []string `json:"errors,omitempty"`
+}
+
 // ==================== 内存中的轻量结构 ====================
 
 // FileItem 扫描结果中的单个文件
@@ -166,7 +227,7 @@ func Init() {
 // InitDB 自动迁移去重模块的数据库表，并清理旧版本遗留的无效结果行
 func InitDB() {
 	d := db.GetDb()
-	if err := d.AutoMigrate(&DedupTask{}, &DedupFileItem{}); err != nil {
+	if err := d.AutoMigrate(&DedupTask{}, &DedupFileItem{}, &DedupDirStat{}); err != nil {
 		log.Errorf("[dedup] failed to migrate database: %v", err)
 		return
 	}
@@ -236,6 +297,63 @@ func SaveDupFiles(taskID string, groups []DupGroup) {
 	if err != nil {
 		log.Errorf("[dedup] failed to save dup files of task %s: %v", taskID, err)
 	}
+}
+
+// SaveDirStats 将扫描期间统计的各目录文件数与总大小持久化
+func SaveDirStats(taskID string, stats map[string]*DirStat) {
+	if len(stats) == 0 {
+		return
+	}
+	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("task_id = ?", taskID).Delete(&DedupDirStat{}).Error; err != nil {
+			return err
+		}
+		batch := make([]DedupDirStat, 0, 500)
+		flush := func() error {
+			if len(batch) == 0 {
+				return nil
+			}
+			if err := tx.CreateInBatches(batch, len(batch)).Error; err != nil {
+				return err
+			}
+			batch = batch[:0]
+			return nil
+		}
+		for _, s := range stats {
+			batch = append(batch, DedupDirStat{
+				TaskID:    taskID,
+				Path:      s.Path,
+				FileCount: s.FileCount,
+				TotalSize: s.TotalSize,
+			})
+			if len(batch) >= 500 {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+		}
+		return flush()
+	})
+	if err != nil {
+		log.Errorf("[dedup] failed to save dir stats of task %s: %v", taskID, err)
+	}
+}
+
+// GetDirStats 读取指定任务的所有目录统计
+func GetDirStats(taskID string) (map[string]*DirStat, error) {
+	var items []DedupDirStat
+	if err := db.GetDb().Where("task_id = ?", taskID).Find(&items).Error; err != nil {
+		return nil, err
+	}
+	res := make(map[string]*DirStat, len(items))
+	for _, item := range items {
+		res[item.Path] = &DirStat{
+			Path:      item.Path,
+			FileCount: item.FileCount,
+			TotalSize: item.TotalSize,
+		}
+	}
+	return res, nil
 }
 
 // MarkInterruptedTasks 启动时将数据库中所有 state="running" 的任务标记为 "interrupted"

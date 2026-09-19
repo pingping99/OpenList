@@ -20,7 +20,7 @@ func TestScan_MinSizeFilter(t *testing.T) {
 
 	// 1. 无过滤：应该扫出 2 组
 	p1 := &Progress{}
-	groups1, err := scan(context.Background(), ScanConfig{RootPath: "/", MinSize: 0, Concurrency: 1, QPS: 1000}, p1, fakeLister(tree))
+	groups1, _, err := scan(context.Background(), ScanConfig{RootPath: "/", MinSize: 0, Concurrency: 1, QPS: 1000}, p1, fakeLister(tree))
 	if err != nil {
 		t.Fatalf("scan failed: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestScan_MinSizeFilter(t *testing.T) {
 
 	// 2. MinSize = 100：small1/small2 (50字节) 应当被过滤，仅留下 large1/large2
 	p2 := &Progress{}
-	groups2, err := scan(context.Background(), ScanConfig{RootPath: "/", MinSize: 100, Concurrency: 1, QPS: 1000}, p2, fakeLister(tree))
+	groups2, _, err := scan(context.Background(), ScanConfig{RootPath: "/", MinSize: 100, Concurrency: 1, QPS: 1000}, p2, fakeLister(tree))
 	if err != nil {
 		t.Fatalf("scan with MinSize failed: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestScan_ExtFilters(t *testing.T) {
 
 	// 1. IncludeExts = ["mp4"]
 	p1 := &Progress{}
-	groups1, err := scan(context.Background(), ScanConfig{
+	groups1, _, err := scan(context.Background(), ScanConfig{
 		RootPath:    "/",
 		IncludeExts: []string{".MP4"}, // 测试大小写与前导点清理
 		Concurrency: 1,
@@ -74,7 +74,7 @@ func TestScan_ExtFilters(t *testing.T) {
 
 	// 2. ExcludeExts = ["pdf", "png"]
 	p2 := &Progress{}
-	groups2, err := scan(context.Background(), ScanConfig{
+	groups2, _, err := scan(context.Background(), ScanConfig{
 		RootPath:    "/",
 		ExcludeExts: []string{"pdf", "png"},
 		Concurrency: 1,

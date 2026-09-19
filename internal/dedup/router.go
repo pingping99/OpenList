@@ -16,6 +16,8 @@ func RegisterRouter(g *gin.RouterGroup) {
 	g.GET("/result", HandleGetResult)
 	g.POST("/remove", HandleBatchRemove)
 	g.GET("/dirs", HandleListDirs)
+	g.GET("/folders", HandleGetDuplicateFolders)
+	g.POST("/folders/merge", HandleMergeFolders)
 	g.GET("/history", HandleListHistory)
 	g.GET("/history/:id", HandleGetHistoryDetail)
 	g.DELETE("/history/:id", HandleDeleteHistory)
