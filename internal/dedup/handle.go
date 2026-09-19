@@ -75,6 +75,7 @@ func canManageTask(user *model.User, task *DedupTask) bool {
 // 都映射到同一个结构，避免前端需要兼容多种字段形态
 type StatusView struct {
 	ID        string     `json:"id"`
+	TaskID    string     `json:"task_id"`
 	RootPath  string     `json:"root_path"`
 	State     string     `json:"state"`
 	Status    string     `json:"status"`
@@ -164,12 +165,46 @@ func tacheStateOf(t *DedupScanTask) bool {
 	}
 }
 
-// HandleGetStatus 查询任务状态与进度
+// HandleGetStatus 查询任务状态与进度（未指定 task_id 时自动返回当前正在运行中的任务）
 func HandleGetStatus(c *gin.Context) {
 	user := currentUser(c)
 	taskID := c.Query("task_id")
 	if taskID == "" {
-		common.ErrorStrResp(c, "缺少 task_id", http.StatusBadRequest)
+		// 1. 优先从内存管理器查找当前用户的进行中任务
+		if DedupTaskManager != nil {
+			running := DedupTaskManager.GetByCondition(func(t *DedupScanTask) bool {
+				return canManageTask(user, taskRecord(t)) && tacheStateOf(t)
+			})
+			if len(running) > 0 {
+				t := running[0]
+				snap := t.Snapshot()
+				common.SuccessResp(c, StatusView{
+					ID:        t.GetID(),
+					TaskID:    t.GetID(),
+					RootPath:  t.Config.RootPath,
+					State:     snap.State,
+					Status:    snap.Status,
+					Progress:  snap.Progress,
+					Stats:     snap.Stats,
+					StartTime: t.GetStartTime(),
+					EndTime:   t.GetEndTime(),
+				})
+				return
+			}
+		}
+
+		// 2. 从数据库查找当前用户仍处于 running 状态的任务
+		var runningTask DedupTask
+		q := db.GetDb().Where("state = ?", "running").Order("started_at DESC")
+		if user != nil && !user.IsAdmin() {
+			q = q.Where("creator_id = ?", user.ID)
+		}
+		if err := q.First(&runningTask).Error; err == nil {
+			common.SuccessResp(c, statusViewFromTask(&runningTask))
+			return
+		}
+
+		common.SuccessResp(c, nil)
 		return
 	}
 
@@ -183,6 +218,7 @@ func HandleGetStatus(c *gin.Context) {
 			snap := t.Snapshot()
 			common.SuccessResp(c, StatusView{
 				ID:        t.GetID(),
+				TaskID:    t.GetID(),
 				RootPath:  t.Config.RootPath,
 				State:     snap.State,
 				Status:    snap.Status,
@@ -221,6 +257,7 @@ func taskRecord(t *DedupScanTask) *DedupTask {
 func statusViewFromTask(task *DedupTask) StatusView {
 	view := StatusView{
 		ID:       task.ID,
+		TaskID:   task.ID,
 		RootPath: task.RootPath,
 		State:    task.State,
 		Stats: ScanStats{

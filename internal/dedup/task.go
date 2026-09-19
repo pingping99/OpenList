@@ -164,6 +164,20 @@ func (t *DedupScanTask) Run() error {
 				t.status = fmt.Sprintf("已扫描 %d 目录 / %d 文件", snap.ScannedDirs, snap.ScannedFiles)
 				t.mu.Unlock()
 				t.Persist()
+
+				// 定时同步更新 x_dedup_tasks 数据库记录，确保长时间扫描期间 DB 数据始终处于最新状态
+				db.GetDb().Model(&DedupTask{}).Where("id = ?", t.GetID()).Updates(map[string]interface{}{
+					"scanned_dirs":     snap.ScannedDirs,
+					"scanned_files":    snap.ScannedFiles,
+					"verified_files":   snap.VerifiedFiles,
+					"unverified_files": snap.UnverifiedFiles,
+					"failed_dirs":      snap.FailedDirs,
+					"dup_groups":       snap.DupGroups,
+					"dup_files":        snap.DupFiles,
+					"wasted_total":     snap.WastedBytes,
+					"candidate_groups": snap.CandidateGroups,
+					"candidate_files":  snap.CandidateFiles,
+				})
 			case <-reportDone:
 				return
 			}
@@ -269,6 +283,11 @@ func InitTaskManager() {
 			db.UpdateTaskDataFunc("dedup", true),
 		),
 	)
+	// 服务启动时，清理此前进程未正常结束的孤儿任务，避免在数据库中永久处于 running 状态
+	db.GetDb().Model(&DedupTask{}).Where("state = ?", "running").Updates(map[string]interface{}{
+		"state": "interrupted",
+		"error": "服务重启，任务已中断",
+	})
 	log.Info("[dedup] native task manager initialized")
 }
 
