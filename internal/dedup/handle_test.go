@@ -116,3 +116,28 @@ func TestRemoveResponseJSONEmptySlices(t *testing.T) {
 		t.Fatalf("expected empty arrays in JSON, got: %s", jsonStr)
 	}
 }
+
+func TestDedupTask_InitialAndCleanedCounters(t *testing.T) {
+	task := DedupTask{
+		ID:               "task-test",
+		InitialDupGroups: 3,
+		InitialDupFiles:  6,
+		InitialWasted:    600,
+		DupGroups:        1,
+		DupFiles:         2,
+		WastedTotal:      200,
+	}
+	if task.InitialDupFiles >= task.DupFiles {
+		task.CleanedFiles = task.InitialDupFiles - task.DupFiles
+	}
+	if task.InitialWasted >= task.WastedTotal {
+		task.CleanedBytes = task.InitialWasted - task.WastedTotal
+	}
+	if task.CleanedFiles != 4 {
+		t.Errorf("expected 4 cleaned files, got %d", task.CleanedFiles)
+	}
+	if task.CleanedBytes != 400 {
+		t.Errorf("expected 400 cleaned bytes, got %d", task.CleanedBytes)
+	}
+}
+

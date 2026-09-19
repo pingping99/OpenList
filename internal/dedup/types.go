@@ -23,14 +23,25 @@ type DedupTask struct {
 	VerifiedFiles   int64      `json:"verified_files"`   // 有可用哈希、参与内容比对的文件数
 	UnverifiedFiles int64      `json:"unverified_files"` // 无可用哈希、仅能按「同名同尺寸」列出的文件数
 	FailedDirs      int64      `json:"failed_dirs"`      // 列举失败的目录数
-	DupGroups       int        `json:"dup_groups"`       // 已校验的重复组数（可清理）
-	DupFiles        int        `json:"dup_files"`        // 已校验的重复文件数
-	WastedTotal     int64      `json:"wasted_total"`     // 已校验重复可释放空间
-	CandidateGroups int        `json:"candidate_groups"` // 未校验候选组数（不可批量清理）
-	CandidateFiles  int        `json:"candidate_files"`  // 未校验候选文件数
-	Error           string     `gorm:"type:text" json:"error,omitempty"`
-	StartedAt       time.Time  `json:"started_at"`
-	EndedAt         *time.Time `json:"ended_at,omitempty"`
+	DupGroups        int        `json:"dup_groups"`       // 已校验的重复组数（可清理）
+	DupFiles         int        `json:"dup_files"`        // 已校验的重复文件数
+	WastedTotal      int64      `json:"wasted_total"`     // 已校验重复可释放空间
+	InitialDupGroups int        `json:"initial_dup_groups"` // 扫描结束时的初始重复组数
+	InitialDupFiles  int        `json:"initial_dup_files"`  // 扫描结束时的初始重复文件数
+	InitialWasted    int64      `json:"initial_wasted"`     // 扫描结束时的初始可释放空间
+	CleanedFiles     int        `json:"cleaned_files"`      // 已清理的副本文件数
+	CleanedBytes     int64      `json:"cleaned_bytes"`      // 已清理释放的字节数
+	MaxDepth         int        `json:"max_depth"`          // 扫描最大深度
+	Concurrency      int        `json:"concurrency"`        // 扫描并发度
+	QPS              float64    `json:"qps"`                // 扫描QPS
+	MinSize          int64      `json:"min_size"`           // 最小文件大小过滤（字节）
+	IncludeExts      string     `gorm:"size:255" json:"include_exts"` // 包含后缀
+	ExcludeExts      string     `gorm:"size:255" json:"exclude_exts"` // 排除后缀
+	CandidateGroups  int        `json:"candidate_groups"` // 未校验候选组数（不可批量清理）
+	CandidateFiles   int        `json:"candidate_files"`  // 未校验候选文件数
+	Error            string     `gorm:"type:text" json:"error,omitempty"`
+	StartedAt        time.Time  `json:"started_at"`
+	EndedAt          *time.Time `json:"ended_at,omitempty"`
 }
 
 // DedupFileItem 已校验重复文件 / 未校验候选文件的记录（持久化到 dedup_file_items 表）
@@ -342,5 +353,16 @@ func RecomputeTaskCounters(taskID string) {
 	task.WastedTotal = stats.WastedBytes
 	task.CandidateGroups = stats.CandidateGroups
 	task.CandidateFiles = stats.CandidateFiles
+	if task.InitialDupFiles == 0 && task.DupFiles > 0 {
+		task.InitialDupGroups = task.DupGroups
+		task.InitialDupFiles = task.DupFiles
+		task.InitialWasted = task.WastedTotal
+	}
+	if task.InitialDupFiles > 0 && task.InitialDupFiles >= task.DupFiles {
+		task.CleanedFiles = task.InitialDupFiles - task.DupFiles
+	}
+	if task.InitialWasted > 0 && task.InitialWasted >= task.WastedTotal {
+		task.CleanedBytes = task.InitialWasted - task.WastedTotal
+	}
 	SaveTask(task)
 }
