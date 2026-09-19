@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
@@ -15,11 +17,50 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+type cachedFolderPairs struct {
+	computedAt time.Time
+	pairs      []DupFolderPair
+}
+
+var (
+	folderPairsCacheMu sync.RWMutex
+	folderPairsCache   = make(map[string]*cachedFolderPairs)
+)
+
+const folderPairsCacheTTL = 5 * time.Minute
+
+// InvalidateFolderPairsCache 清理指定任务或全部任务的重复文件夹计算缓存
+func InvalidateFolderPairsCache(taskID ...string) {
+	folderPairsCacheMu.Lock()
+	defer folderPairsCacheMu.Unlock()
+	if len(taskID) == 0 || taskID[0] == "" {
+		folderPairsCache = make(map[string]*cachedFolderPairs)
+		return
+	}
+	for _, id := range taskID {
+		delete(folderPairsCache, id)
+	}
+}
+
 // FindDuplicateFolders 查找当前任务下重合度 >= threshold 的重复文件夹对
 func FindDuplicateFolders(taskID string, threshold float64) ([]DupFolderPair, error) {
 	if threshold <= 0 {
 		threshold = 0.30 // 默认 30% 阈值
 	}
+
+	folderPairsCacheMu.RLock()
+	cached, ok := folderPairsCache[taskID]
+	if ok && time.Since(cached.computedAt) < folderPairsCacheTTL {
+		folderPairsCacheMu.RUnlock()
+		var res []DupFolderPair
+		for _, p := range cached.pairs {
+			if p.Similarity >= threshold {
+				res = append(res, p)
+			}
+		}
+		return res, nil
+	}
+	folderPairsCacheMu.RUnlock()
 
 	// 1. 读取本任务全部已校验的重复文件（Verified=true）
 	var items []DedupFileItem
@@ -35,7 +76,99 @@ func FindDuplicateFolders(taskID string, threshold float64) ([]DupFolderPair, er
 
 	// 2. 读取各目录的统计信息（总文件数、总大小）
 	dirStats, _ := GetDirStats(taskID)
-	return computeFolderPairs(items, dirStats, threshold), nil
+	minThreshold := 0.10
+	if threshold < minThreshold {
+		minThreshold = threshold
+	}
+	allComputed := computeFolderPairs(items, dirStats, minThreshold)
+
+	folderPairsCacheMu.Lock()
+	folderPairsCache[taskID] = &cachedFolderPairs{
+		computedAt: time.Now(),
+		pairs:      allComputed,
+	}
+	folderPairsCacheMu.Unlock()
+
+	var res []DupFolderPair
+	for _, p := range allComputed {
+		if p.Similarity >= threshold {
+			res = append(res, p)
+		}
+	}
+	return res, nil
+}
+
+// QueryDuplicateFolders 带搜索与分页的重复文件夹查询
+func QueryDuplicateFolders(taskID string, threshold float64, kw string, page, perPage int) (int, []DupFolderPair, error) {
+	if threshold <= 0 {
+		threshold = 0.30
+	}
+	if page <= 0 {
+		page = 1
+	}
+	if perPage <= 0 {
+		perPage = 20
+	}
+	if perPage > 100 {
+		perPage = 100
+	}
+
+	allPairs, err := FindDuplicateFolders(taskID, threshold)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	var filtered []DupFolderPair
+	query := strings.ToLower(strings.TrimSpace(kw))
+	if query == "" {
+		filtered = allPairs
+	} else {
+		for _, p := range allPairs {
+			if strings.Contains(strings.ToLower(p.DirA), query) || strings.Contains(strings.ToLower(p.DirB), query) {
+				filtered = append(filtered, p)
+			}
+		}
+	}
+
+	total := len(filtered)
+	start := (page - 1) * perPage
+	if start >= total {
+		return total, []DupFolderPair{}, nil
+	}
+	end := start + perPage
+	if end > total {
+		end = total
+	}
+
+	// 分页切片，同时对单对的 MatchedFiles 做安全截断（列表中保留前 100 个作为预览，避免超大报文传输）
+	pagePairs := make([]DupFolderPair, end-start)
+	for i, p := range filtered[start:end] {
+		pairCopy := p
+		if len(pairCopy.MatchedFiles) > 100 {
+			pairCopy.MatchedFiles = pairCopy.MatchedFiles[:100]
+		}
+		pagePairs[i] = pairCopy
+	}
+
+	return total, pagePairs, nil
+}
+
+// GetFolderMatchedFiles 获取指定两文件夹之间的重复文件匹配明细
+func GetFolderMatchedFiles(taskID, dirA, dirB string) ([]DupFolderMatchedFile, error) {
+	pairs, err := FindDuplicateFolders(taskID, 0.01)
+	if err != nil {
+		return nil, err
+	}
+	cleanA := utils.FixAndCleanPath(dirA)
+	cleanB := utils.FixAndCleanPath(dirB)
+	for _, p := range pairs {
+		pA := utils.FixAndCleanPath(p.DirA)
+		pB := utils.FixAndCleanPath(p.DirB)
+		if (pA == cleanA && pB == cleanB) || (pA == cleanB && pB == cleanA) {
+			return p.MatchedFiles, nil
+		}
+	}
+	return []DupFolderMatchedFile{}, nil
 }
 
 // computeFolderPairs 核心算法：按目录聚合重复文件，计算两两目录的重合度
@@ -414,6 +547,7 @@ func MergeFolders(ctx context.Context, user *model.User, req MergeFoldersReq) (*
 		}
 		SaveTask(task)
 	}
+	InvalidateFolderPairsCache(req.TaskID)
 
 	return resp, nil
 }

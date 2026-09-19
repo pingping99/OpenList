@@ -529,6 +529,7 @@ func HandleDeleteHistory(c *gin.Context) {
 		common.ErrorResp(c, err, http.StatusInternalServerError, true)
 		return
 	}
+	InvalidateFolderPairsCache(task.ID)
 	common.SuccessResp(c)
 }
 
@@ -561,10 +562,11 @@ func HandleClearEmptyHistory(c *gin.Context) {
 		common.ErrorResp(c, err, http.StatusInternalServerError, true)
 		return
 	}
+	InvalidateFolderPairsCache(targetIDs...)
 	common.SuccessResp(c, gin.H{"deleted": len(targetIDs), "deleted_count": len(targetIDs)})
 }
 
-// HandleGetDuplicateFolders 查询指定任务中重合度大于指定阈值的重复文件夹对
+// HandleGetDuplicateFolders 查询指定任务中重合度大于指定阈值的重复文件夹对（支持分页与关键词过滤）
 func HandleGetDuplicateFolders(c *gin.Context) {
 	user := currentUser(c)
 	taskID := c.Query("task_id")
@@ -588,7 +590,20 @@ func HandleGetDuplicateFolders(c *gin.Context) {
 		threshold = 0.3
 	}
 
-	pairs, err := FindDuplicateFolders(taskID, threshold)
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "20"))
+	if perPage < 1 {
+		perPage = 20
+	}
+	if perPage > 100 {
+		perPage = 100
+	}
+	kw := c.Query("kw")
+
+	total, pairs, err := QueryDuplicateFolders(taskID, threshold, kw, page, perPage)
 	if err != nil {
 		common.ErrorResp(c, err, http.StatusInternalServerError, true)
 		return
@@ -597,8 +612,70 @@ func HandleGetDuplicateFolders(c *gin.Context) {
 	common.SuccessResp(c, gin.H{
 		"task_id":   taskID,
 		"threshold": threshold,
-		"total":     len(pairs),
+		"page":      page,
+		"per_page":  perPage,
+		"total":     total,
 		"folders":   pairs,
+	})
+}
+
+// HandleGetFolderFiles 获取指定两文件夹之间重合文件的完整列表（支持分页）
+func HandleGetFolderFiles(c *gin.Context) {
+	user := currentUser(c)
+	taskID := c.Query("task_id")
+	dirA := c.Query("dir_a")
+	dirB := c.Query("dir_b")
+	if taskID == "" || dirA == "" || dirB == "" {
+		common.ErrorStrResp(c, "缺少必要参数 (task_id, dir_a, dir_b)", http.StatusBadRequest)
+		return
+	}
+	task, err := GetTaskByID(taskID)
+	if err != nil {
+		common.ErrorStrResp(c, "任务不存在", http.StatusNotFound)
+		return
+	}
+	if !canManageTask(user, task) {
+		common.ErrorStrResp(c, "无权查看该任务", http.StatusForbidden)
+		return
+	}
+
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "50"))
+	if perPage < 1 {
+		perPage = 50
+	}
+	if perPage > 200 {
+		perPage = 200
+	}
+
+	matched, err := GetFolderMatchedFiles(taskID, dirA, dirB)
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusInternalServerError, true)
+		return
+	}
+
+	total := len(matched)
+	start := (page - 1) * perPage
+	if start >= total {
+		common.SuccessResp(c, gin.H{
+			"total": total,
+			"page":  page,
+			"files": []DupFolderMatchedFile{},
+		})
+		return
+	}
+	end := start + perPage
+	if end > total {
+		end = total
+	}
+
+	common.SuccessResp(c, gin.H{
+		"total": total,
+		"page":  page,
+		"files": matched[start:end],
 	})
 }
 
@@ -890,6 +967,7 @@ func HandleBatchRemove(c *gin.Context) {
 			log.Errorf("[dedup] failed to drop dangling groups: %v", err)
 		} else {
 			RecomputeTaskCounters(req.TaskID)
+			InvalidateFolderPairsCache(req.TaskID)
 		}
 	}
 
