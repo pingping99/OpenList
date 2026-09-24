@@ -426,6 +426,19 @@ func HandleListHistory(c *gin.Context) {
 		q = q.Where("creator_id = ?", user.ID)
 	}
 
+	keyword := strings.TrimSpace(c.Query("keyword"))
+	if keyword != "" {
+		q = q.Where("root_path LIKE ?", "%"+keyword+"%")
+	}
+	status := strings.TrimSpace(c.Query("status"))
+	if status == "pending" {
+		q = q.Where("dup_groups > 0")
+	} else if status == "cleaned" {
+		q = q.Where("initial_dup_groups > 0 AND dup_groups = 0")
+	} else if status == "empty" {
+		q = q.Where("initial_dup_groups = 0 AND candidate_groups = 0")
+	}
+
 	var total int64
 	if err := q.Count(&total).Error; err != nil {
 		common.ErrorResp(c, err, http.StatusInternalServerError, true)
@@ -480,6 +493,38 @@ func HandleDeleteHistory(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c)
+}
+
+// HandleClearEmptyHistory 清理所有扫描结果为0重复或已全部清理完毕的历史记录
+func HandleClearEmptyHistory(c *gin.Context) {
+	user := currentUser(c)
+	if user == nil {
+		common.ErrorStrResp(c, "未登录", http.StatusUnauthorized)
+		return
+	}
+	q := db.GetDb().Model(&DedupTask{}).Where("state != ?", "running").Where("dup_groups = 0 AND candidate_groups = 0")
+	if !user.IsAdmin() {
+		q = q.Where("creator_id = ?", user.ID)
+	}
+	var targetIDs []string
+	if err := q.Pluck("id", &targetIDs).Error; err != nil {
+		common.ErrorResp(c, err, http.StatusInternalServerError, true)
+		return
+	}
+	if len(targetIDs) == 0 {
+		common.SuccessResp(c, gin.H{"deleted": 0, "deleted_count": 0})
+		return
+	}
+	if err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("task_id IN ?", targetIDs).Delete(&DedupFileItem{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("id IN ?", targetIDs).Delete(&DedupTask{}).Error
+	}); err != nil {
+		common.ErrorResp(c, err, http.StatusInternalServerError, true)
+		return
+	}
+	common.SuccessResp(c, gin.H{"deleted": len(targetIDs), "deleted_count": len(targetIDs)})
 }
 
 // ==================== 清理 ====================

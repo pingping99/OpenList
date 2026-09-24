@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -129,10 +130,16 @@ func (t *DedupScanTask) Run() error {
 
 	progress := &Progress{}
 	taskRow := &DedupTask{
-		ID:        t.GetID(),
-		RootPath:  t.Config.RootPath,
-		State:     "running",
-		StartedAt: now,
+		ID:          t.GetID(),
+		RootPath:    t.Config.RootPath,
+		State:       "running",
+		MaxDepth:    t.Config.MaxDepth,
+		Concurrency: t.Config.Concurrency,
+		QPS:         t.Config.QPS,
+		MinSize:     t.Config.MinSize,
+		IncludeExts: strings.Join(t.Config.IncludeExts, ","),
+		ExcludeExts: strings.Join(t.Config.ExcludeExts, ","),
+		StartedAt:   now,
 	}
 	if creator := t.GetCreator(); creator != nil {
 		taskRow.Creator = creator.Username
@@ -201,24 +208,35 @@ func (t *DedupScanTask) Run() error {
 	}
 
 	SaveTask(&DedupTask{
-		ID:              t.GetID(),
-		RootPath:        t.Config.RootPath,
-		State:           state,
-		Creator:         taskRow.Creator,
-		CreatorID:       taskRow.CreatorID,
-		ScannedDirs:     stats.ScannedDirs,
-		ScannedFiles:    stats.ScannedFiles,
-		VerifiedFiles:   stats.VerifiedFiles,
-		UnverifiedFiles: stats.UnverifiedFiles,
-		FailedDirs:      stats.FailedDirs,
-		DupGroups:       stats.DupGroups,
-		DupFiles:        stats.DupFiles,
-		WastedTotal:     stats.WastedBytes,
-		CandidateGroups: stats.CandidateGroups,
-		CandidateFiles:  stats.CandidateFiles,
-		Error:           taskErr,
-		StartedAt:       now,
-		EndedAt:         &end,
+		ID:               t.GetID(),
+		RootPath:         t.Config.RootPath,
+		State:            state,
+		Creator:          taskRow.Creator,
+		CreatorID:        taskRow.CreatorID,
+		ScannedDirs:      stats.ScannedDirs,
+		ScannedFiles:     stats.ScannedFiles,
+		VerifiedFiles:    stats.VerifiedFiles,
+		UnverifiedFiles:  stats.UnverifiedFiles,
+		FailedDirs:       stats.FailedDirs,
+		DupGroups:        stats.DupGroups,
+		DupFiles:         stats.DupFiles,
+		WastedTotal:      stats.WastedBytes,
+		InitialDupGroups: stats.DupGroups,
+		InitialDupFiles:  stats.DupFiles,
+		InitialWasted:    stats.WastedBytes,
+		CleanedFiles:     0,
+		CleanedBytes:     0,
+		MaxDepth:         t.Config.MaxDepth,
+		Concurrency:      t.Config.Concurrency,
+		QPS:              t.Config.QPS,
+		MinSize:          t.Config.MinSize,
+		IncludeExts:      strings.Join(t.Config.IncludeExts, ","),
+		ExcludeExts:      strings.Join(t.Config.ExcludeExts, ","),
+		CandidateGroups:  stats.CandidateGroups,
+		CandidateFiles:   stats.CandidateFiles,
+		Error:            taskErr,
+		StartedAt:        now,
+		EndedAt:          &end,
 	})
 
 	return err
